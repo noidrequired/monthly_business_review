@@ -465,6 +465,7 @@ def _draw_table(cnv: canvas.Canvas, x: float, y: float, w: float, row_h: float, 
             cnv.drawString(x + j * col_w + 6, row_y + 6, s[:40])
 
 def make_chart_bar(values: pd.Series, title: str) -> bytes:
+    import matplotlib.pyplot as plt
     fig = plt.figure(figsize=(10, 4))
     ax = fig.add_subplot(111)
     ax.set_title(title)
