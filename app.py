@@ -1,53 +1,62 @@
 import io
 import math
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional
 
-import numpy as np
 import pandas as pd
 import streamlit as st
+import matplotlib.pyplot as plt
+from PIL import Image
 
-# PDF (no charts)
+from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.units import mm
-from reportlab.lib import colors
-from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    Image as RLImage,
+    PageBreak,
+)
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 
 # -----------------------------
-# Theme (close to your spec)
+# Theme / Design Tokens
 # -----------------------------
-C = {
-    "text_primary": "#1F2933",
-    "text_secondary": "#4B5563",
-    "text_muted": "#9CA3AF",
-    "bg": "#FFFFFF",
-    "divider": "#E5E7EB",
-    "accent": "#1D4ED8",
-    "positive": "#16A34A",
-    "amber": "#D97706",
-    "critical": "#DC2626",
-    "table_header_bg": "#F3F4F6",
-    "row_alt": "#F9FAFB",
+COLORS = {
+    "text_primary": colors.HexColor("#1F2933"),
+    "text_secondary": colors.HexColor("#4B5563"),
+    "text_muted": colors.HexColor("#9CA3AF"),
+    "bg": colors.HexColor("#FFFFFF"),
+    "divider": colors.HexColor("#E5E7EB"),
+    "accent": colors.HexColor("#1D4ED8"),
+    "pos": colors.HexColor("#16A34A"),
+    "amber": colors.HexColor("#D97706"),
+    "critical": colors.HexColor("#DC2626"),
+    "neutral": colors.HexColor("#64748B"),
+    "table_header_bg": colors.HexColor("#F3F4F6"),
+    "row_alt": colors.HexColor("#F9FAFB"),
+    "kpi_pos_bg": colors.HexColor("#DCFCE7"),
+    "kpi_risk_bg": colors.HexColor("#FEF3C7"),
+    "kpi_crit_bg": colors.HexColor("#FEE2E2"),
 }
 
-MILESTONES = {
-    "Arrival at Origin": {
-        "actual": "Origin actual arrival time",
-        "planned_end": "Origin latest planned arrival end time",
-    },
-    "Departure at Origin": {
-        "actual": "Origin actual departure time",
-        "planned_end": "Origin latest planned departure end time",
-    },
-    "Arrival at Destination": {
-        "actual": "Destination actual arrival time",
-        "planned_end": "Destination latest planned arrival end time",
-    },
-}
+PAGE_W, PAGE_H = landscape(A4)
 
-SHIPMENT_COLS_REQUIRED = [
+MARGINS_CONTENT = dict(left=24 * mm, right=20 * mm, top=18 * mm, bottom=18 * mm)
+MARGINS_COVER = dict(left=32 * mm, right=32 * mm, top=28 * mm, bottom=28 * mm)
+
+
+# -----------------------------
+# Expected Columns
+# -----------------------------
+EXPECTED_COLS = [
     "Shipment ID",
     "Shipment type",
     "Created time",
@@ -77,823 +86,964 @@ SHIPMENT_COLS_REQUIRED = [
     "Destination latest planned arrival end time",
 ]
 
-RCA_KEEP_COLS = [
-    "Root Cause Error",
-    "Root Cause Error Details",
-    "Bill Of Lading",
-    "Order Number",
-    "Carrier",
-    "Creation Date",
-    "Tracking End Date",
-]
+
+MILESTONES = {
+    "Arrival at Origin": {
+        "actual": "Origin actual arrival time",
+        "planned_end": "Origin latest planned arrival end time",
+        "estimated": "Origin estimated arrival time",
+    },
+    "Departure from Origin": {
+        "actual": "Origin actual departure time",
+        "planned_end": "Origin latest planned departure end time",
+        "estimated": "Origin estimated departure time",
+    },
+    "Arrival at Destination": {
+        "actual": "Destination actual arrival time",
+        "planned_end": "Destination latest planned arrival end time",
+        "estimated": "Destination estimated arrival time",
+    },
+}
 
 
 # -----------------------------
-# Helpers
+# Utilities
 # -----------------------------
-def hex_to_rl(h: str):
-    h = h.lstrip("#")
-    r = int(h[0:2], 16) / 255
-    g = int(h[2:4], 16) / 255
-    b = int(h[4:6], 16) / 255
-    return colors.Color(r, g, b)
+def safe_to_datetime(series: pd.Series) -> pd.Series:
+    """
+    Parse datetimes robustly, leaving blanks/invalid as NaT.
+    Works for sample formats like '07/01/26 11:46' etc.
+    """
+    return pd.to_datetime(series, errors="coerce", infer_datetime_format=True)
 
 
-def _to_dt(s: pd.Series) -> pd.Series:
-    return pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
+def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    # Trim column names
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
 
-
-@st.cache_data(show_spinner=False)
-def load_shipments_cached(file_bytes: bytes, filename: str) -> pd.DataFrame:
-    bio = io.BytesIO(file_bytes)
-    if filename.lower().endswith(".csv"):
-        df = pd.read_csv(bio)
-    else:
-        df = pd.read_excel(bio)
-
-    missing = [c for c in SHIPMENT_COLS_REQUIRED if c not in df.columns]
+    # Check missing columns (we won't hard-fail; we’ll warn and continue)
+    missing = [c for c in EXPECTED_COLS if c not in df.columns]
     if missing:
-        raise ValueError(f"Shipment file missing columns: {missing}")
+        st.warning(
+            "Some expected columns are missing. The app will run with what it has.\n\n"
+            f"Missing: {', '.join(missing)}"
+        )
 
-    # Parse date/time columns (only the ones we actually use + milestone columns)
-    needed_dt = ["Created time"]
-    for m in MILESTONES.values():
-        needed_dt += [m["actual"], m["planned_end"]]
-    needed_dt += ["Destination estimated arrival time", "Destination actual arrival time", "Destination latest planned arrival end time"]
-    needed_dt = [c for c in dict.fromkeys(needed_dt) if c in df.columns]
+    # Parse key datetime columns if present
+    dt_cols = [c for c in EXPECTED_COLS if "time" in c.lower()]
+    for c in dt_cols:
+        if c in df.columns:
+            df[c] = safe_to_datetime(df[c])
 
-    for c in needed_dt:
-        df[c] = _to_dt(df[c])
+    # Basic cleanup for text columns
+    for c in [
+        "Shipment ID",
+        "Shipment type",
+        "Current state",
+        "Current state reason",
+        "Exceptions",
+        "Current carrier",
+        "Origin",
+        "Origin city",
+        "Origin state",
+        "Origin country",
+        "Destination",
+        "Destination city",
+        "Destination state",
+        "Destination country",
+    ]:
+        if c in df.columns:
+            df[c] = df[c].astype("string").fillna("").str.strip()
 
-    # Normalize key fields
-    df["Shipment ID"] = df["Shipment ID"].astype(str).replace("nan", "").fillna("")
-    df["Current carrier"] = df["Current carrier"].astype(str).replace("nan", "").fillna("")
-    df["Current state"] = df["Current state"].astype(str).replace("nan", "").fillna("")
-    df["Current state reason"] = df["Current state reason"].astype(str).replace("nan", "").fillna("")
-    df["Exceptions"] = df["Exceptions"].astype(str).replace("nan", "").fillna("")
-
-    return df
-
-
-@st.cache_data(show_spinner=False)
-def load_rca_cached(file_bytes: bytes, filename: str) -> pd.DataFrame:
-    bio = io.BytesIO(file_bytes)
-    if filename.lower().endswith(".csv"):
-        df = pd.read_csv(bio)
+    # Lane field
+    if "Origin" in df.columns and "Destination" in df.columns:
+        df["Lane"] = (df["Origin"].fillna("") + " → " + df["Destination"].fillna("")).str.strip()
     else:
-        df = pd.read_excel(bio)
+        df["Lane"] = ""
 
-    keep = [c for c in RCA_KEEP_COLS if c in df.columns]
-    df = df[keep].copy()
-
-    for c in ["Bill Of Lading", "Order Number", "Root Cause Error", "Carrier"]:
-        if c in df.columns:
-            df[c] = df[c].astype(str).replace("nan", "").fillna("")
-
-    # match key = Shipment ID
-    df["match_shipment_id"] = ""
-    if "Bill Of Lading" in df.columns and "Order Number" in df.columns:
-        df["match_shipment_id"] = df["Bill Of Lading"].where(df["Bill Of Lading"] != "", df["Order Number"])
-    elif "Bill Of Lading" in df.columns:
-        df["match_shipment_id"] = df["Bill Of Lading"]
-    elif "Order Number" in df.columns:
-        df["match_shipment_id"] = df["Order Number"]
-
-    for c in ["Creation Date", "Tracking End Date"]:
-        if c in df.columns:
-            df[c] = _to_dt(df[c])
+    # Shipment unique id as string
+    if "Shipment ID" in df.columns:
+        df["Shipment ID"] = df["Shipment ID"].astype("string")
 
     return df
 
 
-def parse_exceptions(val: str) -> List[str]:
-    s = "" if val is None else str(val).strip()
-    if s == "" or s.lower() == "nan":
-        return []
-    parts = []
-    for token in s.replace("|", ";").replace(",", ";").split(";"):
-        t = token.strip()
-        if t:
-            parts.append(t)
-    return parts
+def read_uploaded_file(uploaded) -> pd.DataFrame:
+    name = uploaded.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(uploaded)
+    else:
+        # Excel
+        df = pd.read_excel(uploaded, engine="openpyxl")
+    return df
 
 
-def build_lane_cols(df: pd.DataFrame) -> pd.Series:
-    # Vectorized lane: prefer city/state/country; fall back to Origin/Destination
-    o_city = df["Origin city"].fillna("").astype(str).str.strip()
-    o_state = df["Origin state"].fillna("").astype(str).str.strip()
-    o_country = df["Origin country"].fillna("").astype(str).str.strip()
-    d_city = df["Destination city"].fillna("").astype(str).str.strip()
-    d_state = df["Destination state"].fillna("").astype(str).str.strip()
-    d_country = df["Destination country"].fillna("").astype(str).str.strip()
-
-    def join3(a, b, c):
-        out = a
-        out = np.where((out != "") & (b != ""), out + ", " + b, np.where(out == "", b, out))
-        out = np.where((out != "") & (c != ""), out + ", " + c, np.where(out == "", c, out))
-        return pd.Series(out)
-
-    o = join3(o_city, o_state, o_country)
-    d = join3(d_city, d_state, d_country)
-
-    o_fallback = df["Origin"].fillna("").astype(str).str.strip()
-    d_fallback = df["Destination"].fillna("").astype(str).str.strip()
-
-    o = np.where(o.astype(str).str.strip() == "", o_fallback, o)
-    d = np.where(d.astype(str).str.strip() == "", d_fallback, d)
-
-    return pd.Series(o).astype(str) + " → " + pd.Series(d).astype(str)
-
-
-def milestone_reported(df: pd.DataFrame, milestone_name: str) -> pd.Series:
-    return df[MILESTONES[milestone_name]["actual"]].notna()
-
-
-def on_time(df: pd.DataFrame, milestone_name: str, latency_minutes: int) -> pd.Series:
-    actual = df[MILESTONES[milestone_name]["actual"]]
-    planned_end = df[MILESTONES[milestone_name]["planned_end"]]
-    latency = pd.to_timedelta(latency_minutes, unit="m")
-    ok = actual.notna() & planned_end.notna()
-    out = pd.Series(False, index=df.index)
-    out[ok] = actual[ok] <= (planned_end[ok] + latency)
-    return out
-
-
-def destination_eta_accurate(df: pd.DataFrame, latency_minutes: int) -> pd.Series:
-    est = df["Destination estimated arrival time"]
-    act = df["Destination actual arrival time"]
-    latency = pd.to_timedelta(latency_minutes, unit="m")
-    ok = est.notna() & act.notna()
-    out = pd.Series(False, index=df.index)
-    out[ok] = (act[ok] - est[ok]).abs() <= latency
-    return out
-
-
-def completion_bucket(df: pd.DataFrame, selected_milestones: List[str]) -> pd.Series:
-    state = df["Current state"].astype(str).str.upper()
-    reason = df["Current state reason"].astype(str).str.upper()
-
-    is_completed = state.eq("COMPLETED")
-    is_timedout_reason = reason.eq("TRACKING_TIMED_OUT")
-
-    all_reported = pd.Series(True, index=df.index)
-    for m in selected_milestones:
-        all_reported &= milestone_reported(df, m)
-
-    bucket = pd.Series("In Progress / Other", index=df.index)
-    bucket[is_completed & ~is_timedout_reason] = "Completed"
-    bucket[is_completed & is_timedout_reason & ~all_reported] = "Timed Out"
-    bucket[is_completed & is_timedout_reason & all_reported] = "Completed"
-
-    # Preserve other states text
-    other = ~is_completed
-    bucket[other] = df.loc[other, "Current state"].replace("", "Unknown")
-    return bucket
-
-
-# -----------------------------
-# PDF (tables only)
-# -----------------------------
-@dataclass
-class PdfConfig:
-    customer_name: str
-    date_range_label: str
-    latency_minutes: int
-    selected_milestones: List[str]
-    logo_bytes: Optional[bytes]
-
-
-def draw_footer(cnv: canvas.Canvas, cfg: PdfConfig, page_num: int, page_total: int, margin_left: float, margin_right: float, margin_bottom: float):
-    w, _ = landscape(A4)
-    cnv.setFont("Helvetica", 8.5)
-    cnv.setFillColor(hex_to_rl(C["text_muted"]))
-    y = margin_bottom - 8
-    cnv.drawString(margin_left, y, cfg.customer_name)
-    cnv.drawCentredString(w / 2, y, "Confidential – Customer Use Only")
-    cnv.drawRightString(w - margin_right, y, f"Page {page_num} of {page_total}")
-
-
-def draw_header(cnv: canvas.Canvas, cfg: PdfConfig, title: str, margin_left: float, margin_right: float, margin_top: float):
-    w, h = landscape(A4)
-    y = h - margin_top + 6
-
-    if cfg.logo_bytes:
-        try:
-            img = ImageReader(io.BytesIO(cfg.logo_bytes))
-            cnv.drawImage(img, margin_left, y - 18, width=60, height=18, mask="auto", preserveAspectRatio=True)
-        except Exception:
-            pass
-
-    cnv.setFont("Helvetica-Bold", 14)
-    cnv.setFillColor(hex_to_rl(C["text_primary"]))
-    cnv.drawRightString(w - margin_right, y - 6, title)
-
-    cnv.setStrokeColor(hex_to_rl(C["divider"]))
-    cnv.setLineWidth(1)
-    cnv.line(margin_left, y - 24, w - margin_right, y - 24)
-
-
-def draw_cover(cnv: canvas.Canvas, cfg: PdfConfig):
-    w, h = landscape(A4)
-    margin_left = 32 * mm
-    margin_top = 28 * mm
-
-    cnv.setFillColor(hex_to_rl(C["bg"]))
-    cnv.rect(0, 0, w, h, fill=1, stroke=0)
-
-    if cfg.logo_bytes:
-        try:
-            img = ImageReader(io.BytesIO(cfg.logo_bytes))
-            cnv.drawImage(img, margin_left, h - margin_top - 22, width=110, height=32, mask="auto", preserveAspectRatio=True)
-        except Exception:
-            pass
-
-    cnv.setFillColor(hex_to_rl(C["text_primary"]))
-    cnv.setFont("Helvetica-Bold", 36)
-    cnv.drawString(margin_left, h - margin_top - 110, "Monthly Business Review Report")
-
-    cnv.setFont("Helvetica", 20)
-    cnv.setFillColor(hex_to_rl(C["text_secondary"]))
-    cnv.drawString(margin_left, h - margin_top - 145, f"{cfg.customer_name} / {cfg.date_range_label}")
-
-    cnv.setFont("Helvetica", 14)
-    cnv.setFillColor(hex_to_rl(C["text_muted"]))
-    cnv.drawString(margin_left, h - margin_top - 175, f"Latency allowance: {cfg.latency_minutes} minutes")
-    cnv.drawString(margin_left, h - margin_top - 195, f"Milestones: {', '.join(cfg.selected_milestones)}")
-
-
-def draw_section_intro(cnv: canvas.Canvas, cfg: PdfConfig, section_title: str, section_desc: str):
-    w, h = landscape(A4)
-    margin_left = 32 * mm
-    margin_top = 28 * mm
-
-    cnv.setFillColor(hex_to_rl(C["bg"]))
-    cnv.rect(0, 0, w, h, fill=1, stroke=0)
-
-    if cfg.logo_bytes:
-        try:
-            img = ImageReader(io.BytesIO(cfg.logo_bytes))
-            cnv.drawImage(img, margin_left, h - margin_top - 22, width=90, height=26, mask="auto", preserveAspectRatio=True)
-        except Exception:
-            pass
-
-    cnv.setFont("Helvetica-Bold", 28)
-    cnv.setFillColor(hex_to_rl(C["text_primary"]))
-    cnv.drawString(margin_left, h - margin_top - 110, section_title)
-
-    cnv.setFont("Helvetica", 14)
-    cnv.setFillColor(hex_to_rl(C["text_secondary"]))
-    text_obj = cnv.beginText(margin_left, h - margin_top - 145)
-    text_obj.setLeading(18)
-    for line in section_desc.split("\n"):
-        text_obj.textLine(line)
-    cnv.drawText(text_obj)
-
-
-def draw_kpi_grid(cnv: canvas.Canvas, x: float, y: float, w: float, h: float, items: List[Dict]):
-    gap = 8
-    n = len(items)
-    card_w = (w - gap * (n - 1)) / n
-    for i, it in enumerate(items):
-        cx = x + i * (card_w + gap)
-        tone = it.get("tone", "neutral")
-        border = {
-            "neutral": C["divider"],
-            "good": C["positive"],
-            "warn": C["amber"],
-            "bad": C["critical"],
-            "accent": C["accent"],
-        }.get(tone, C["divider"])
-
-        cnv.setFillColor(hex_to_rl(C["bg"]))
-        cnv.setStrokeColor(hex_to_rl(border))
-        cnv.setLineWidth(1)
-        cnv.roundRect(cx, y, card_w, h, 10, fill=1, stroke=1)
-
-        cnv.setFont("Helvetica", 10.5)
-        cnv.setFillColor(hex_to_rl(C["text_secondary"]))
-        cnv.drawString(cx + 10, y + h - 18, it["title"])
-
-        cnv.setFont("Helvetica-Bold", 18)
-        cnv.setFillColor(hex_to_rl(C["text_primary"]))
-        cnv.drawString(cx + 10, y + h - 42, it["value"])
-
-        cnv.setFont("Helvetica", 9.5)
-        cnv.setFillColor(hex_to_rl(C["text_muted"]))
-        cnv.drawString(cx + 10, y + 10, it.get("subtitle", ""))
-
-
-def draw_table_block(
-    cnv: canvas.Canvas,
+def apply_include_exclude_filter(
     df: pd.DataFrame,
-    title: str,
-    margin_left: float,
-    margin_right: float,
-    margin_top: float,
-    margin_bottom: float,
-    max_rows: int = 14,
-):
-    """Draws a title + simple table (no wrapping). Caller paginates df."""
-    w, h = landscape(A4)
-    block_w = w - margin_left - margin_right
+    col: str,
+    start: Optional[pd.Timestamp],
+    end: Optional[pd.Timestamp],
+    mode: str,
+) -> pd.DataFrame:
+    """
+    mode: "Include" keeps rows inside [start, end]
+          "Exclude" removes rows inside [start, end]
+    """
+    if col not in df.columns:
+        return df
+    if start is None or end is None:
+        return df
 
-    cnv.setFont("Helvetica-Bold", 14)
-    cnv.setFillColor(hex_to_rl(C["text_primary"]))
-    cnv.drawString(margin_left, h - margin_top - 56, title)
-
-    # table geometry
-    row_h = 18
-    table_x = margin_left
-    table_y = margin_bottom + 30  # bottom of table
-    table_rows = max_rows
-    table_w = block_w
-
-    cols = list(df.columns)
-    if len(cols) == 0:
-        return
-
-    col_w = table_w / len(cols)
-
-    # Header row
-    cnv.setFillColor(hex_to_rl(C["table_header_bg"]))
-    cnv.setStrokeColor(hex_to_rl(C["divider"]))
-    cnv.setLineWidth(0.5)
-    cnv.rect(table_x, table_y + row_h * table_rows, table_w, row_h, fill=1, stroke=1)
-
-    cnv.setFont("Helvetica-Bold", 10.5)
-    cnv.setFillColor(hex_to_rl(C["text_primary"]))
-    for j, col in enumerate(cols):
-        cnv.drawString(table_x + j * col_w + 6, table_y + row_h * table_rows + 6, str(col)[:40])
-
-    # Body rows
-    cnv.setFont("Helvetica", 10)
-    for i in range(min(table_rows, len(df))):
-        y = table_y + row_h * (table_rows - 1 - i)
-        fill = C["bg"] if i % 2 == 0 else C["row_alt"]
-        cnv.setFillColor(hex_to_rl(fill))
-        cnv.rect(table_x, y, table_w, row_h, fill=1, stroke=1)
-
-        cnv.setFillColor(hex_to_rl(C["text_secondary"]))
-        for j, col in enumerate(cols):
-            val = df.iloc[i, j]
-            s = "" if pd.isna(val) else str(val)
-            cnv.drawString(table_x + j * col_w + 6, y + 6, s[:46])
+    s = df[col]
+    mask = (s >= start) & (s <= end)
+    return df[mask] if mode == "Include" else df[~mask]
 
 
-def build_pdf(
-    cfg: PdfConfig,
-    kpis: Dict[str, str],
-    contract: Dict[str, float],
-    state_summary: pd.DataFrame,
-    milestone_reporting: pd.DataFrame,
-    ontime_summary: pd.DataFrame,
-    carrier_table: pd.DataFrame,
-    lane_table: pd.DataFrame,
-    rca_tables: Dict[str, pd.DataFrame],
-) -> bytes:
-    w, h = landscape(A4)
+def apply_include_exclude_list(
+    df: pd.DataFrame,
+    col: str,
+    selected: List[str],
+    mode: str,
+) -> pd.DataFrame:
+    if col not in df.columns:
+        return df
+    if not selected:
+        return df
+    mask = df[col].isin(selected)
+    return df[mask] if mode == "Include" else df[~mask]
 
-    # Margins (content pages)
-    margin_left = 24 * mm
-    margin_right = 20 * mm
-    margin_top = 18 * mm
-    margin_bottom = 18 * mm
 
-    pages = []
+def reported_mask(df: pd.DataFrame, milestone_name: str) -> pd.Series:
+    actual_col = MILESTONES[milestone_name]["actual"]
+    if actual_col not in df.columns:
+        return pd.Series([False] * len(df), index=df.index)
+    return df[actual_col].notna()
 
-    # Cover
-    pages.append(lambda cnv, pn, pt: draw_cover(cnv, cfg))
 
-    # Section intro
-    pages.append(lambda cnv, pn, pt: draw_section_intro(
-        cnv, cfg,
-        "Executive Summary",
-        "KPI overview, milestone reporting and on-time performance.\nTables only (no charts)."
-    ))
+def all_selected_reported_mask(df: pd.DataFrame, selected_milestones: List[str]) -> pd.Series:
+    if not selected_milestones:
+        return pd.Series([False] * len(df), index=df.index)
+    masks = [reported_mask(df, m) for m in selected_milestones]
+    out = masks[0].copy()
+    for m in masks[1:]:
+        out &= m
+    return out
 
-    # Exec summary content
-    def exec_page(cnv, pn, pt):
-        cnv.setFillColor(hex_to_rl(C["bg"]))
-        cnv.rect(0, 0, w, h, fill=1, stroke=0)
-        draw_header(cnv, cfg, "Executive Summary", margin_left, margin_right, margin_top)
 
-        # KPI grid
-        grid_x = margin_left
-        grid_y = h - margin_top - 120
-        grid_w = w - margin_left - margin_right
-        draw_kpi_grid(
-            cnv, grid_x, grid_y, grid_w, 64,
-            [
-                {"title": "# Shipments", "value": kpis["shipments"], "subtitle": "Filtered", "tone": "accent"},
-                {"title": "# Carriers", "value": kpis["carriers"], "subtitle": "Unique", "tone": "neutral"},
-                {"title": "Reporting %", "value": kpis["reporting_pct"], "subtitle": "All selected milestones",
-                 "tone": "good" if float(kpis["reporting_pct"].rstrip("%")) >= 80 else "warn"},
-                {"title": "On-time %", "value": kpis["ontime_pct"], "subtitle": f"Latency: {cfg.latency_minutes}m",
-                 "tone": "good" if float(kpis["ontime_pct"].rstrip("%")) >= 80 else "warn"},
-            ]
-        )
+def compute_completion_status(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rule:
+    - If Current state == COMPLETED:
+        - If Current state reason == TRACKING_TIMED_OUT:
+            - If ALL 3 core milestone actual timestamps exist -> Completed
+            - Else -> Timed Out
+        - Else -> Completed
+    - Else -> Not Completed
+    """
+    out = df.copy()
+    state = out["Current state"] if "Current state" in out.columns else ""
+    reason = out["Current state reason"] if "Current state reason" in out.columns else ""
 
-        # Contract line
-        cnv.setFont("Helvetica-Bold", 14)
-        cnv.setFillColor(hex_to_rl(C["text_primary"]))
-        cnv.drawString(margin_left, grid_y - 28, "Contract Consumption")
+    core = ["Arrival at Origin", "Departure from Origin", "Arrival at Destination"]
+    core_reported = all_selected_reported_mask(out, core)
 
-        contracted = float(contract.get("contracted", 0.0))
-        billed = float(contract.get("billed", 0.0))
-        pct = (billed / contracted * 100) if contracted else 0.0
-        tone = C["positive"] if billed <= contracted else C["critical"]
+    out["Completion Bucket"] = "Not Completed"
+    completed_mask = state.eq("COMPLETED")
 
-        cnv.setFont("Helvetica", 11)
-        cnv.setFillColor(hex_to_rl(C["text_secondary"]))
-        cnv.drawString(margin_left, grid_y - 48, f"Contracted volume: {contracted:,.0f}")
-        cnv.drawString(margin_left, grid_y - 64, f"Billed volume: {billed:,.0f}")
-        cnv.setFillColor(hex_to_rl(tone))
-        cnv.drawString(margin_left, grid_y - 80, f"Consumption: {pct:.1f}%")
+    timed_out_mask = completed_mask & reason.eq("TRACKING_TIMED_OUT")
+    out.loc[completed_mask & ~timed_out_mask, "Completion Bucket"] = "Completed"
+    out.loc[timed_out_mask & core_reported, "Completion Bucket"] = "Completed"
+    out.loc[timed_out_mask & ~core_reported, "Completion Bucket"] = "Timed Out"
 
-        # Tables (stack 3 small tables on one page: state, milestone reporting, on-time)
-        # We'll show top rows to keep it readable.
-        # State summary
-        draw_table_block(
-            cnv,
-            state_summary.head(10),
-            "Shipment State Summary",
-            margin_left, margin_right, margin_top + 120, margin_bottom,
-            max_rows=6,
-        )
-        # Milestone reporting
-        draw_table_block(
-            cnv,
-            milestone_reporting,
-            "Milestone Reporting",
-            margin_left, margin_right, margin_top + 260, margin_bottom,
-            max_rows=6,
-        )
-        # On-time
-        draw_table_block(
-            cnv,
-            ontime_summary,
-            "On-time Performance (Planned End vs Actual)",
-            margin_left, margin_right, margin_top + 400, margin_bottom,
-            max_rows=6,
-        )
+    return out
 
-        draw_footer(cnv, cfg, pn, pt, margin_left, margin_right, margin_bottom)
 
-    pages.append(exec_page)
+def on_time_mask(df: pd.DataFrame, milestone_name: str, latency_minutes: int) -> pd.Series:
+    """
+    On-time uses planned END time (always) vs actual time.
+    On-time if actual <= planned_end + latency.
+    """
+    actual_col = MILESTONES[milestone_name]["actual"]
+    planned_col = MILESTONES[milestone_name]["planned_end"]
 
-    # Carrier section intro
-    pages.append(lambda cnv, pn, pt: draw_section_intro(
-        cnv, cfg,
-        "Carrier Performance",
-        "Carrier-wise shipment volume, milestone reporting, and on-time performance.\nPaginated tables (≤ 14 rows per page)."
-    ))
+    if actual_col not in df.columns or planned_col not in df.columns:
+        return pd.Series([False] * len(df), index=df.index)
 
-    # Carrier table pages
-    rows_per_page = 14
-    carrier_pages = max(1, math.ceil(len(carrier_table) / rows_per_page))
-    for p in range(carrier_pages):
-        start = p * rows_per_page
-        chunk = carrier_table.iloc[start:start + rows_per_page].copy()
+    actual = df[actual_col]
+    planned_end = df[planned_col]
+    # must have both actual and planned_end to assess
+    valid = actual.notna() & planned_end.notna()
+    delta_ok = actual <= (planned_end + pd.to_timedelta(latency_minutes, unit="m"))
+    return valid & delta_ok
 
-        def _page_factory(df_chunk=chunk):
-            def _p(cnv, pn, pt):
-                cnv.setFillColor(hex_to_rl(C["bg"]))
-                cnv.rect(0, 0, w, h, fill=1, stroke=0)
-                draw_header(cnv, cfg, "Carrier Performance", margin_left, margin_right, margin_top)
-                draw_table_block(cnv, df_chunk, "Carrier Summary", margin_left, margin_right, margin_top, margin_bottom, max_rows=rows_per_page)
-                draw_footer(cnv, cfg, pn, pt, margin_left, margin_right, margin_bottom)
-            return _p
 
-        pages.append(_page_factory())
+def estimated_accuracy_mask(df: pd.DataFrame, milestone_name: str, latency_minutes: int) -> pd.Series:
+    """
+    "Estimated was accurate with actual" = abs(actual - estimated) <= latency
+    """
+    actual_col = MILESTONES[milestone_name]["actual"]
+    est_col = MILESTONES[milestone_name]["estimated"]
+    if actual_col not in df.columns or est_col not in df.columns:
+        return pd.Series([False] * len(df), index=df.index)
 
-    # Lane section intro
-    pages.append(lambda cnv, pn, pt: draw_section_intro(
-        cnv, cfg,
-        "Lane Insights",
-        "Lane-wise (Origin → Destination) reporting and on-time.\nPaginated tables."
-    ))
+    actual = df[actual_col]
+    est = df[est_col]
+    valid = actual.notna() & est.notna()
+    diff = (actual - est).abs()
+    return valid & (diff <= pd.to_timedelta(latency_minutes, unit="m"))
 
-    lane_pages = max(1, math.ceil(len(lane_table) / rows_per_page))
-    for p in range(lane_pages):
-        start = p * rows_per_page
-        chunk = lane_table.iloc[start:start + rows_per_page].copy()
 
-        def _page_factory(df_chunk=chunk):
-            def _p(cnv, pn, pt):
-                cnv.setFillColor(hex_to_rl(C["bg"]))
-                cnv.rect(0, 0, w, h, fill=1, stroke=0)
-                draw_header(cnv, cfg, "Lane Insights", margin_left, margin_right, margin_top)
-                draw_table_block(cnv, df_chunk, "Lane Summary", margin_left, margin_right, margin_top, margin_bottom, max_rows=rows_per_page)
-                draw_footer(cnv, cfg, pn, pt, margin_left, margin_right, margin_bottom)
-            return _p
+def kpi_bg_color(consumption_ratio: float) -> colors.Color:
+    if consumption_ratio <= 1.0:
+        return COLORS["kpi_pos_bg"]
+    if consumption_ratio <= 1.05:
+        return COLORS["kpi_risk_bg"]
+    return COLORS["kpi_crit_bg"]
 
-        pages.append(_page_factory())
 
-    # RCA intro
-    pages.append(lambda cnv, pn, pt: draw_section_intro(
-        cnv, cfg,
-        "Root Cause Analysis",
-        "Carrier-wise affected shipments for Creation, Tracking and Milestone RCA.\nTables only."
-    ))
+def fmt_pct(x: float) -> str:
+    if pd.isna(x):
+        return "—"
+    return f"{x:.1f}%"
 
-    # One page per RCA type (top 14 rows)
-    for title, df_rca in rca_tables.items():
-        def _rca_page_factory(t=title, d=df_rca.head(rows_per_page)):
-            def _p(cnv, pn, pt):
-                cnv.setFillColor(hex_to_rl(C["bg"]))
-                cnv.rect(0, 0, w, h, fill=1, stroke=0)
-                draw_header(cnv, cfg, "Root Cause Analysis", margin_left, margin_right, margin_top)
-                draw_table_block(cnv, d, t, margin_left, margin_right, margin_top, margin_bottom, max_rows=rows_per_page)
-                draw_footer(cnv, cfg, pn, pt, margin_left, margin_right, margin_bottom)
-            return _p
-        pages.append(_rca_page_factory())
 
-    # Render PDF
+def fmt_int(x) -> str:
+    if pd.isna(x):
+        return "—"
+    try:
+        return f"{int(x):,}"
+    except Exception:
+        return str(x)
+
+
+# -----------------------------
+# Simple chart helpers (matplotlib)
+# -----------------------------
+def fig_to_png_bytes(fig) -> bytes:
     buf = io.BytesIO()
-    cnv = canvas.Canvas(buf, pagesize=landscape(A4))
-    total = len(pages)
-
-    for idx, fn in enumerate(pages, start=1):
-        fn(cnv, idx, total)
-        cnv.showPage()
-
-    cnv.save()
+    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
     return buf.getvalue()
 
 
+def bar_chart(series: pd.Series, title: str, xlabel: str = "", ylabel: str = "") -> bytes:
+    fig = plt.figure(figsize=(7.6, 3.3))
+    ax = fig.add_subplot(111)
+    s = series.copy()
+    s = s.sort_values(ascending=False)
+    ax.bar(s.index.astype(str), s.values)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.tick_params(axis="x", rotation=35)
+    fig.tight_layout()
+    return fig_to_png_bytes(fig)
+
+
 # -----------------------------
-# Streamlit App
+# PDF generation
+# -----------------------------
+@dataclass
+class ReportMeta:
+    customer_name: str
+    date_range_label: str
+    report_title: str
+
+
+def build_styles():
+    # We’ll use Helvetica by default (PDF-safe). If you later upload Inter TTF files,
+    # you can register them here.
+    base = getSampleStyleSheet()
+
+    base.add(
+        ParagraphStyle(
+            name="H1",
+            fontName="Helvetica-Bold",
+            fontSize=20,
+            leading=24,
+            textColor=COLORS["text_primary"],
+            spaceAfter=10,
+        )
+    )
+    base.add(
+        ParagraphStyle(
+            name="H2",
+            fontName="Helvetica-Bold",
+            fontSize=16,
+            leading=20,
+            textColor=COLORS["text_primary"],
+            spaceAfter=8,
+        )
+    )
+    base.add(
+        ParagraphStyle(
+            name="Body",
+            fontName="Helvetica",
+            fontSize=11,
+            leading=15,
+            textColor=COLORS["text_primary"],
+        )
+    )
+    base.add(
+        ParagraphStyle(
+            name="Muted",
+            fontName="Helvetica",
+            fontSize=9.5,
+            leading=12,
+            textColor=COLORS["text_secondary"],
+        )
+    )
+    base.add(
+        ParagraphStyle(
+            name="CoverTitle",
+            fontName="Helvetica-Bold",
+            fontSize=36,
+            leading=42,
+            textColor=COLORS["text_primary"],
+            spaceAfter=14,
+        )
+    )
+    base.add(
+        ParagraphStyle(
+            name="CoverSub",
+            fontName="Helvetica-Bold",
+            fontSize=20,
+            leading=26,
+            textColor=COLORS["text_secondary"],
+            spaceAfter=10,
+        )
+    )
+    base.add(
+        ParagraphStyle(
+            name="CoverSmall",
+            fontName="Helvetica",
+            fontSize=14,
+            leading=18,
+            textColor=COLORS["text_secondary"],
+        )
+    )
+    base.add(
+        ParagraphStyle(
+            name="Foot",
+            fontName="Helvetica",
+            fontSize=8.5,
+            leading=10,
+            textColor=COLORS["text_muted"],
+        )
+    )
+    return base
+
+
+def footer_and_header(canvas, doc, meta: ReportMeta, logo_bytes: Optional[bytes]):
+    canvas.saveState()
+
+    # Header (logo)
+    if logo_bytes:
+        try:
+            # place at top-left within content margins
+            x = doc.leftMargin
+            y = PAGE_H - doc.topMargin + 3 * mm
+            img = Image.open(io.BytesIO(logo_bytes)).convert("RGBA")
+            # keep it small and neat
+            target_h = 10 * mm
+            ratio = img.width / img.height
+            target_w = target_h * ratio
+            canvas.drawImage(
+                ImageReader(io.BytesIO(logo_bytes)),
+                x,
+                y - target_h,
+                width=target_w,
+                height=target_h,
+                mask="auto",
+            )
+        except Exception:
+            pass
+
+    # Footer
+    canvas.setFont("Helvetica", 8.5)
+    canvas.setFillColor(COLORS["text_muted"])
+
+    left = meta.customer_name
+    center = "Confidential – Customer Use Only"
+    right = f"Page {doc.page} of {doc.pageCount}" if hasattr(doc, "pageCount") else f"Page {doc.page}"
+
+    y = doc.bottomMargin - 8 * mm
+    canvas.drawString(doc.leftMargin, y, left)
+    canvas.drawCentredString(PAGE_W / 2, y, center)
+    canvas.drawRightString(PAGE_W - doc.rightMargin, y, right)
+
+    canvas.restoreState()
+
+
+# ReportLab needs this helper for drawImage with bytes.
+from reportlab.lib.utils import ImageReader
+
+
+def make_kpi_table(kpis: List[Tuple[str, str]]) -> Table:
+    data = []
+    for label, value in kpis:
+        data.append([label, value])
+
+    t = Table(data, colWidths=[80 * mm, 60 * mm])
+    t.setStyle(
+        TableStyle(
+            [
+                ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 0), (-1, -1), 11),
+                ("TEXTCOLOR", (0, 0), (-1, -1), COLORS["text_primary"]),
+                ("BACKGROUND", (0, 0), (-1, -1), COLORS["bg"]),
+                ("LINEBELOW", (0, 0), (-1, -1), 0.5, COLORS["divider"]),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ]
+        )
+    )
+    return t
+
+
+def styled_table(df: pd.DataFrame, max_rows: int = 14) -> Table:
+    show = df.head(max_rows).copy()
+    data = [list(show.columns)] + show.astype(str).values.tolist()
+
+    t = Table(data, repeatRows=1)
+    style_cmds = [
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, 0), 10.5),
+        ("BACKGROUND", (0, 0), (-1, 0), COLORS["table_header_bg"]),
+        ("TEXTCOLOR", (0, 0), (-1, 0), COLORS["text_primary"]),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.5, COLORS["divider"]),
+        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 1), (-1, -1), 10),
+        ("GRID", (0, 0), (-1, -1), 0.5, COLORS["divider"]),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]
+
+    # alternating row backgrounds
+    for r in range(1, len(data)):
+        bg = COLORS["row_alt"] if r % 2 == 0 else COLORS["bg"]
+        style_cmds.append(("BACKGROUND", (0, r), (-1, r), bg))
+
+    t.setStyle(TableStyle(style_cmds))
+    return t
+
+
+def generate_pdf(
+    meta: ReportMeta,
+    kpis: Dict,
+    carrier_table: pd.DataFrame,
+    otp_table: pd.DataFrame,
+    lane_milestone_table: pd.DataFrame,
+    lane_otp_table: pd.DataFrame,
+    charts: Dict[str, bytes],
+    logo_bytes: Optional[bytes],
+    screenshot_bytes: Optional[bytes],
+) -> bytes:
+    buf = io.BytesIO()
+
+    styles = build_styles()
+
+    # We'll generate in 2 passes to get total page count:
+    # Use a custom doc template where we set pageCount after build.
+    class CountingDoc(SimpleDocTemplate):
+        def afterFlowable(self, flowable):
+            pass
+
+    # First build story to count pages is heavier; a simpler way:
+    # Build once, then re-build with the known pagecount isn't trivial.
+    # We'll do a pragmatic approach: footer shows "Page X" (no total).
+    # If you *must* have total pages, we can implement a two-pass canvas later.
+
+    doc = CountingDoc(
+        buf,
+        pagesize=landscape(A4),
+        leftMargin=MARGINS_CONTENT["left"],
+        rightMargin=MARGINS_CONTENT["right"],
+        topMargin=MARGINS_CONTENT["top"],
+        bottomMargin=MARGINS_CONTENT["bottom"],
+        title=meta.report_title,
+        author="Streamlit App",
+    )
+
+    story = []
+
+    # --- Cover page (different margins visually via spacing) ---
+    story.append(Spacer(1, 18 * mm))
+    story.append(Paragraph("Monthly Business Review Report", styles["CoverTitle"]))
+    story.append(Paragraph(meta.customer_name, styles["CoverSub"]))
+    story.append(Paragraph(meta.date_range_label, styles["CoverSmall"]))
+    story.append(Spacer(1, 12 * mm))
+    story.append(Paragraph("Prepared for external sharing", styles["Muted"]))
+    story.append(PageBreak())
+
+    # --- Section intro ---
+    story.append(Paragraph("Executive Summary", styles["H1"]))
+    story.append(Paragraph("High-level KPIs and reporting performance overview.", styles["Body"]))
+    story.append(Spacer(1, 10 * mm))
+
+    # KPI block
+    kpi_pairs = [
+        ("Number of Shipments", fmt_int(kpis["num_shipments"])),
+        ("Number of Carriers", fmt_int(kpis["num_carriers"])),
+        ("Shipments reporting ALL selected milestones", fmt_int(kpis["num_all_selected"])),
+        ("% reporting ALL selected milestones", fmt_pct(kpis["pct_all_selected"])),
+        ("Marked Completed", fmt_int(kpis["num_marked_completed"])),
+        ("Timed Out (per rule)", fmt_int(kpis["num_timed_out"])),
+    ]
+    story.append(make_kpi_table(kpi_pairs))
+    story.append(Spacer(1, 6 * mm))
+
+    # Contract consumption
+    story.append(Paragraph("Contract Consumption", styles["H2"]))
+    story.append(Paragraph(kpis["contract_text"], styles["Body"]))
+    story.append(Spacer(1, 6 * mm))
+    story.append(PageBreak())
+
+    # --- Milestone Reporting page ---
+    story.append(Paragraph("Milestone Reporting", styles["H1"]))
+    story.append(Paragraph("Reporting counts and percentages for selected milestones.", styles["Body"]))
+    story.append(Spacer(1, 4 * mm))
+
+    if charts.get("milestone_reporting"):
+        img = RLImage(io.BytesIO(charts["milestone_reporting"]), width=240 * mm, height=90 * mm)
+        story.append(img)
+        story.append(Spacer(1, 6 * mm))
+
+    story.append(styled_table(kpis["milestone_table"], max_rows=14))
+    story.append(PageBreak())
+
+    # --- Carrier-wise page ---
+    story.append(Paragraph("Carrier-wise Summary", styles["H1"]))
+    story.append(Paragraph("Shipment volumes and reporting performance by carrier.", styles["Body"]))
+    story.append(Spacer(1, 6 * mm))
+    story.append(styled_table(carrier_table, max_rows=14))
+    story.append(PageBreak())
+
+    # --- OTP page ---
+    story.append(Paragraph("On-time Performance (OTP)", styles["H1"]))
+    story.append(Paragraph("On-time is calculated using latest planned END time + allowed latency.", styles["Body"]))
+    story.append(Spacer(1, 4 * mm))
+
+    if charts.get("otp_by_event"):
+        img = RLImage(io.BytesIO(charts["otp_by_event"]), width=240 * mm, height=90 * mm)
+        story.append(img)
+        story.append(Spacer(1, 6 * mm))
+
+    story.append(styled_table(otp_table, max_rows=14))
+    story.append(PageBreak())
+
+    # --- Lane insights page ---
+    story.append(Paragraph("Lane Insights", styles["H1"]))
+    story.append(Paragraph("Milestone reporting % and OTP lane-wise (Origin → Destination).", styles["Body"]))
+    story.append(Spacer(1, 6 * mm))
+
+    story.append(Paragraph("Top lanes by shipment volume – Milestone reporting", styles["H2"]))
+    story.append(styled_table(lane_milestone_table, max_rows=12))
+    story.append(Spacer(1, 6 * mm))
+    story.append(Paragraph("Top lanes by shipment volume – On-time performance", styles["H2"]))
+    story.append(styled_table(lane_otp_table, max_rows=12))
+
+    # --- Optional screenshot page ---
+    if screenshot_bytes:
+        story.append(PageBreak())
+        story.append(Paragraph("Embedded Screenshot", styles["H1"]))
+        story.append(Paragraph("As provided by the user for this report.", styles["Body"]))
+        story.append(Spacer(1, 6 * mm))
+        img = Image.open(io.BytesIO(screenshot_bytes)).convert("RGB")
+        # Fit to page content area
+        content_w = PAGE_W - (MARGINS_CONTENT["left"] + MARGINS_CONTENT["right"])
+        content_h = PAGE_H - (MARGINS_CONTENT["top"] + MARGINS_CONTENT["bottom"] + 20 * mm)
+        # Keep aspect
+        ratio = img.width / img.height
+        target_w = content_w
+        target_h = target_w / ratio
+        if target_h > content_h:
+            target_h = content_h
+            target_w = target_h * ratio
+        story.append(RLImage(io.BytesIO(screenshot_bytes), width=target_w, height=target_h))
+
+    def on_page(canvas, doc_):
+        # Header+footer on each page
+        footer_and_header(canvas, doc_, meta, logo_bytes)
+
+    doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
+
+    buf.seek(0)
+    return buf.read()
+
+
+# -----------------------------
+# App UI
 # -----------------------------
 st.set_page_config(page_title="Monthly Business Review Report", layout="wide")
 
+st.title("Monthly Business Review Report Builder")
+st.caption("Upload your shipment file, filter, review the dashboard, and export a beautifully formatted PDF.")
+
+
+with st.sidebar:
+    st.header("1) Upload")
+    uploaded = st.file_uploader("Upload Excel or CSV", type=["xlsx", "xls", "csv"])
+    st.divider()
+
+    st.header("2) Report Details")
+    customer_name = st.text_input("Customer name", value="Customer")
+    contracted_volume = st.number_input("Contracted volume", min_value=0.0, value=1000.0, step=10.0)
+    billed_volume = st.number_input("Billed volume", min_value=0.0, value=900.0, step=10.0)
+
+    st.divider()
+    st.header("3) Assets")
+    st.caption("Logo: defaults to project44 if not provided.")
+    logo_up = st.file_uploader("Upload logo (PNG)", type=["png"], key="logo")
+    screenshot_up = st.file_uploader("Upload screenshot to embed (PNG/JPG)", type=["png", "jpg", "jpeg"], key="shot")
+
+    st.divider()
+    st.header("4) Filters")
+
+    date_basis = st.selectbox(
+        "Date filter basis",
+        options=["Destination latest planned arrival end time", "Created time"],
+        index=0,
+    )
+    date_mode = st.radio("Date filter mode", options=["Include", "Exclude"], horizontal=True)
+
+    carrier_mode = st.radio("Carrier filter mode", options=["Include", "Exclude"], horizontal=True)
+
+    st.divider()
+    st.header("5) Milestones & OTP")
+    selected_milestones = st.multiselect(
+        "Milestones/events to evaluate reporting",
+        options=list(MILESTONES.keys()),
+        default=["Arrival at Origin", "Departure from Origin", "Arrival at Destination"],
+    )
+    latency_minutes = st.selectbox("Allowed latency", options=[0, 5, 10, 15, 30, 60], index=1)
+    st.caption("On-time uses latest planned END time + allowed latency.")
+
+
+if not uploaded:
+    st.info("Upload your Excel/CSV to begin.")
+    st.stop()
+
+raw_df = read_uploaded_file(uploaded)
+df = normalize_df(raw_df)
+df = compute_completion_status(df)
+
+# Determine date column
+date_col = "Destination latest planned arrival end time" if date_basis.startswith("Destination") else "Created time"
+if date_col in df.columns and df[date_col].notna().any():
+    min_dt = df[date_col].min()
+    max_dt = df[date_col].max()
+else:
+    min_dt = None
+    max_dt = None
+
+# Date picker
+colA, colB, colC = st.columns([1, 1, 2])
+with colA:
+    start_date = st.date_input(
+        "Start date",
+        value=min_dt.date() if min_dt is not None else datetime.today().date(),
+    )
+with colB:
+    end_date = st.date_input(
+        "End date",
+        value=max_dt.date() if max_dt is not None else datetime.today().date(),
+    )
+
+start_ts = pd.Timestamp(start_date)
+end_ts = pd.Timestamp(end_date) + pd.Timedelta(hours=23, minutes=59, seconds=59)
+
+# Carrier selection based on data
+carriers = sorted([c for c in df["Current carrier"].dropna().unique().tolist() if str(c).strip() != ""]) if "Current carrier" in df.columns else []
+selected_carriers = st.multiselect("Carriers", options=carriers, default=carriers[: min(len(carriers), 10)])
+
+# Apply filters
+fdf = df.copy()
+fdf = apply_include_exclude_filter(fdf, date_col, start_ts, end_ts, date_mode)
+fdf = apply_include_exclude_list(fdf, "Current carrier", selected_carriers, carrier_mode)
+
+# Milestone reporting
+all_selected_mask = all_selected_reported_mask(fdf, selected_milestones)
+num_shipments = fdf["Shipment ID"].nunique() if "Shipment ID" in fdf.columns else len(fdf)
+num_carriers = fdf["Current carrier"].nunique() if "Current carrier" in fdf.columns else 0
+num_all_selected = int(all_selected_mask.sum())
+pct_all_selected = (num_all_selected / num_shipments * 100) if num_shipments else float("nan")
+
+# State summary with rule
+state_counts = fdf["Current state"].value_counts(dropna=False) if "Current state" in fdf.columns else pd.Series(dtype=int)
+completion_counts = fdf["Completion Bucket"].value_counts(dropna=False) if "Completion Bucket" in fdf.columns else pd.Series(dtype=int)
+
+num_marked_completed = int((fdf["Current state"] == "COMPLETED").sum()) if "Current state" in fdf.columns else 0
+num_timed_out = int((fdf["Completion Bucket"] == "Timed Out").sum()) if "Completion Bucket" in fdf.columns else 0
+
+# Exceptions summary
+exceptions_series = fdf["Exceptions"] if "Exceptions" in fdf.columns else pd.Series([""] * len(fdf))
+no_exc = int((exceptions_series.fillna("").str.strip() == "").sum())
+with_exc = len(fdf) - no_exc
+exc_counts = (
+    exceptions_series.fillna("")
+    .astype("string")
+    .str.strip()
+    .replace("", pd.NA)
+    .dropna()
+    .value_counts()
+)
+
+# Milestone eventwise counts
+rows = []
+for m in selected_milestones:
+    rep = reported_mask(fdf, m)
+    rows.append(
+        {
+            "Milestone": m,
+            "Reported (#)": int(rep.sum()),
+            "Reported (%)": round((rep.sum() / num_shipments * 100), 1) if num_shipments else None,
+        }
+    )
+milestone_table = pd.DataFrame(rows)
+
+# OTP tables eventwise
+otp_rows = []
+for m in selected_milestones:
+    rep = reported_mask(fdf, m)
+    ot = on_time_mask(fdf, m, latency_minutes)
+    denom = int((rep & fdf[MILESTONES[m]["planned_end"]].notna()).sum()) if MILESTONES[m]["planned_end"] in fdf.columns else 0
+    otp_rows.append(
+        {
+            "Event": m,
+            "Assessable (#)": denom,
+            "On-time (#)": int(ot.sum()),
+            "On-time (%)": round((ot.sum() / denom * 100), 1) if denom else None,
+        }
+    )
+otp_table = pd.DataFrame(otp_rows)
+
+# Destination estimated accuracy
+dest_est_acc = estimated_accuracy_mask(fdf, "Arrival at Destination", latency_minutes)
+dest_est_assessable = int(
+    (fdf[MILESTONES["Arrival at Destination"]["actual"]].notna() & fdf[MILESTONES["Arrival at Destination"]["estimated"]].notna()).sum()
+) if (
+    MILESTONES["Arrival at Destination"]["actual"] in fdf.columns
+    and MILESTONES["Arrival at Destination"]["estimated"] in fdf.columns
+) else 0
+
+dest_est_accurate = int(dest_est_acc.sum())
+dest_est_pct = round((dest_est_accurate / dest_est_assessable * 100), 1) if dest_est_assessable else None
+
+# Carrier-wise view
+carrier_group = []
+if "Current carrier" in fdf.columns and "Shipment ID" in fdf.columns:
+    for carrier, g in fdf.groupby("Current carrier"):
+        ship = g["Shipment ID"].nunique()
+        all_sel = int(all_selected_reported_mask(g, selected_milestones).sum())
+        carrier_group.append(
+            {
+                "Carrier": carrier if str(carrier).strip() else "(Blank)",
+                "Shipments": ship,
+                "All selected milestones (#)": all_sel,
+                "All selected milestones (%)": round(all_sel / ship * 100, 1) if ship else None,
+            }
+        )
+carrier_table = pd.DataFrame(carrier_group).sort_values("Shipments", ascending=False)
+
+# Lane insights
+lane_m_table = pd.DataFrame()
+lane_o_table = pd.DataFrame()
+if "Lane" in fdf.columns and "Shipment ID" in fdf.columns and fdf["Lane"].astype(str).str.strip().ne("").any():
+    lane_group = []
+    for lane, g in fdf.groupby("Lane"):
+        ship = g["Shipment ID"].nunique()
+        all_sel = int(all_selected_reported_mask(g, selected_milestones).sum())
+        lane_group.append(
+            {
+                "Lane": lane,
+                "Shipments": ship,
+                "All selected milestones (%)": round(all_sel / ship * 100, 1) if ship else None,
+            }
+        )
+    lane_m_table = pd.DataFrame(lane_group).sort_values("Shipments", ascending=False)
+
+    lane_o_group = []
+    for lane, g in fdf.groupby("Lane"):
+        ship = g["Shipment ID"].nunique()
+        # OTP for destination arrival as a headline; also average OTP across selected events
+        event_otps = []
+        for m in selected_milestones:
+            rep = reported_mask(g, m)
+            ot = on_time_mask(g, m, latency_minutes)
+            denom = int((rep & g[MILESTONES[m]["planned_end"]].notna()).sum()) if MILESTONES[m]["planned_end"] in g.columns else 0
+            if denom:
+                event_otps.append(float(ot.sum()) / denom * 100)
+        avg_otp = sum(event_otps) / len(event_otps) if event_otps else None
+        lane_o_group.append(
+            {
+                "Lane": lane,
+                "Shipments": ship,
+                "Avg OTP across selected events (%)": round(avg_otp, 1) if avg_otp is not None else None,
+            }
+        )
+    lane_o_table = pd.DataFrame(lane_o_group).sort_values("Shipments", ascending=False)
+
+# Contract consumption text
+consumption_ratio = (billed_volume / contracted_volume) if contracted_volume else float("inf")
+consumption_text = (
+    f"Contracted: {contracted_volume:,.0f} | Billed: {billed_volume:,.0f} | "
+    f"Consumption: {consumption_ratio*100:,.1f}%"
+)
+
+# -----------------------------
+# Dashboard Layout
+# -----------------------------
+st.subheader("Summary")
+
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Shipments", f"{num_shipments:,}")
+k2.metric("Carriers", f"{num_carriers:,}")
+k3.metric("All selected milestones (#)", f"{num_all_selected:,}")
+k4.metric("All selected milestones (%)", fmt_pct(pct_all_selected))
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Marked Completed", f"{num_marked_completed:,}")
+c2.metric("Timed Out (per rule)", f"{num_timed_out:,}")
+c3.metric("Destination ETA accurate (assessable)", f"{dest_est_accurate:,} / {dest_est_assessable:,}")
+
+# Contract consumption card-like block
+bg = kpi_bg_color(consumption_ratio)
 st.markdown(
     f"""
-    <style>
-      .block-container {{ padding-top: 1.2rem; padding-bottom: 2rem; }}
-      h1, h2, h3, h4, h5 {{ color: {C['text_primary']}; }}
-    </style>
-    """,
+<div style="padding:14px;border:1px solid #E5E7EB;border-radius:14px;background:{bg.hexval()};
+color:#1F2933;">
+  <div style="font-size:16px;font-weight:700;margin-bottom:6px;">Contract Consumption</div>
+  <div style="font-size:13px;">{consumption_text}</div>
+</div>
+""",
     unsafe_allow_html=True,
 )
 
-st.title("Monthly Business Review Report Builder (Tables + PDF, No Charts)")
+st.divider()
 
-with st.sidebar:
-    st.header("Upload files")
-    shipments_file = st.file_uploader("Shipment details (CSV/Excel)", type=["csv", "xlsx", "xls"])
-    rca_creation_file = st.file_uploader("RCA – Creation (Excel/CSV)", type=["xlsx", "xls", "csv"])
-    rca_tracking_file = st.file_uploader("RCA – Tracking (Excel/CSV)", type=["xlsx", "xls", "csv"])
-    rca_milestone_file = st.file_uploader("RCA – Milestone (Excel/CSV)", type=["xlsx", "xls", "csv"])
-    logo_file = st.file_uploader("Project44 logo (PNG)", type=["png"])
+left, right = st.columns([1.1, 1.0])
 
-    st.divider()
-    st.header("Report inputs")
-    customer_name = st.text_input("Customer name", value="Customer Name")
-    contracted_volume = st.number_input("Contracted volume", min_value=0.0, value=0.0, step=1.0)
-    billed_volume = st.number_input("Billed volume", min_value=0.0, value=0.0, step=1.0)
-
-    latency_minutes = st.selectbox("Latency allowed (minutes)", options=[5, 10, 15, 30, 60], index=3)
-
-    st.divider()
-    st.header("Filters")
-    date_basis = st.radio("Date filter based on", ["Destination latest planned arrival end time", "Created time"], index=0)
-    selected_milestones = st.multiselect("Milestones / events", list(MILESTONES.keys()),
-                                         default=["Arrival at Destination", "Departure at Origin", "Arrival at Origin"])
-
-    run = st.button("Run report", type="primary")
-
-
-if not shipments_file:
-    st.info("Upload the shipment details file to start.")
-    st.stop()
-
-# Load data (cached)
-try:
-    shipments_df = load_shipments_cached(shipments_file.getvalue(), shipments_file.name)
-except Exception as e:
-    st.error(str(e))
-    st.stop()
-
-rca_creation_df = load_rca_cached(rca_creation_file.getvalue(), rca_creation_file.name) if rca_creation_file else pd.DataFrame()
-rca_tracking_df = load_rca_cached(rca_tracking_file.getvalue(), rca_tracking_file.name) if rca_tracking_file else pd.DataFrame()
-rca_milestone_df = load_rca_cached(rca_milestone_file.getvalue(), rca_milestone_file.name) if rca_milestone_file else pd.DataFrame()
-
-# Choose date column
-date_col = "Destination latest planned arrival end time" if date_basis.startswith("Destination") else "Created time"
-if shipments_df[date_col].isna().all():
-    st.warning(f"Date column '{date_col}' has no parseable dates.")
-    st.stop()
-
-min_d = shipments_df[date_col].min()
-max_d = shipments_df[date_col].max()
-
-c1, c2 = st.columns(2)
-with c1:
-    date_from = st.date_input("From", value=min_d.date())
-with c2:
-    date_to = st.date_input("To", value=max_d.date())
-
-# Carrier filters (computed on full set)
-carriers_all = sorted([c for c in shipments_df["Current carrier"].dropna().unique() if str(c).strip() and str(c).lower() != "nan"])
-c3, c4 = st.columns(2)
-with c3:
-    carrier_mode = st.radio("Carriers filter", ["Include selected", "Exclude selected"], horizontal=True, index=0)
-with c4:
-    carrier_pick = st.multiselect("Carriers", options=carriers_all, default=[])
-
-if not run:
-    st.caption("Set filters and click **Run report**.")
-    st.stop()
-
-# Apply filters
-df = shipments_df.copy()
-mask_range = (df[date_col] >= pd.Timestamp(date_from)) & (df[date_col] < (pd.Timestamp(date_to) + pd.Timedelta(days=1)))
-df = df[mask_range].copy()
-
-if carrier_pick:
-    if carrier_mode == "Include selected":
-        df = df[df["Current carrier"].isin(carrier_pick)].copy()
+with left:
+    st.subheader("Shipment state summary")
+    if not state_counts.empty:
+        st.dataframe(state_counts.reset_index().rename(columns={"index": "Current state", "Current state": "Count"}), use_container_width=True)
     else:
-        df = df[~df["Current carrier"].isin(carrier_pick)].copy()
+        st.write("No state data available.")
 
-if df.empty:
-    st.warning("No shipments match the selected filters.")
-    st.stop()
+    st.subheader("Completion bucket (with timed-out override rule)")
+    if not completion_counts.empty:
+        st.dataframe(completion_counts.reset_index().rename(columns={"index": "Completion Bucket", "Completion Bucket": "Count"}), use_container_width=True)
+    else:
+        st.write("No completion data available.")
 
-# Derived fields
-df["Lane"] = build_lane_cols(df)
-df["Completion bucket"] = completion_bucket(df, selected_milestones)
-df["Exception list"] = df["Exceptions"].apply(parse_exceptions)
-df["Has exceptions"] = df["Exception list"].apply(lambda x: len(x) > 0)
+with right:
+    st.subheader("Exceptions summary")
+    st.write(f"Shipments without exceptions: **{no_exc:,}**")
+    st.write(f"Shipments with exceptions: **{with_exc:,}**")
+    if not exc_counts.empty:
+        st.dataframe(exc_counts.reset_index().rename(columns={"index": "Exception", "Exceptions": "Count"}), use_container_width=True)
+    else:
+        st.write("No exceptions present (or column missing).")
 
-for m in selected_milestones:
-    df[f"Reported: {m}"] = milestone_reported(df, m)
-    df[f"On-time: {m}"] = on_time(df, m, latency_minutes)
+st.divider()
 
-df["All selected milestones reported"] = True
-for m in selected_milestones:
-    df["All selected milestones reported"] &= df[f"Reported: {m}"]
+st.subheader("Milestone reporting (selected)")
+st.dataframe(milestone_table, use_container_width=True)
 
-df["All selected milestones on-time"] = True
-for m in selected_milestones:
-    df["All selected milestones on-time"] &= df[f"On-time: {m}"]
-
-df["Destination ETA accurate"] = destination_eta_accurate(df, latency_minutes)
-
-# KPIs
-num_shipments = df["Shipment ID"].nunique()
-num_carriers = df["Current carrier"].nunique()
-reporting_all_pct = float(df["All selected milestones reported"].mean() * 100)
-ontime_all_pct = float(df["All selected milestones on-time"].mean() * 100)
-eta_acc_pct = float(df["Destination ETA accurate"].mean() * 100)
-
-st.subheader("Overview (tables)")
-k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("# Shipments", f"{num_shipments:,}")
-k2.metric("# Carriers", f"{num_carriers:,}")
-k3.metric("Reporting % (all)", f"{reporting_all_pct:.1f}%")
-k4.metric("On-time % (all)", f"{ontime_all_pct:.1f}%")
-k5.metric("Destination ETA accuracy %", f"{eta_acc_pct:.1f}%")
-
-# State summary
-state_summary = df["Completion bucket"].value_counts(dropna=False).reset_index()
-state_summary.columns = ["State / Bucket", "Shipments"]
-
-# Milestone reporting summary
-mr_rows = []
-ot_rows = []
-for m in selected_milestones:
-    rep = int(df[f"Reported: {m}"].sum())
-    rep_pct = rep / len(df) * 100
-    ot = int(df[f"On-time: {m}"].sum())
-    ot_pct = ot / len(df) * 100
-    mr_rows.append([m, rep, f"{rep_pct:.1f}%"])
-    ot_rows.append([m, ot, f"{ot_pct:.1f}%"])
-
-milestone_reporting_df = pd.DataFrame(mr_rows, columns=["Milestone", "Shipments reported", "Reporting %"])
-ontime_df = pd.DataFrame(ot_rows, columns=["Milestone", "On-time shipments", "On-time %"])
-
-# Exceptions breakdown
-ex_none = int((~df["Has exceptions"]).sum())
-ex_yes = int(df["Has exceptions"].sum())
-
-st.markdown("### Shipment state summary")
-st.dataframe(state_summary, use_container_width=True)
-
-st.markdown("### Milestone reporting")
-st.dataframe(milestone_reporting_df, use_container_width=True)
-
-st.markdown("### On-time performance (event-wise)")
-st.dataframe(ontime_df, use_container_width=True)
-
-st.markdown("### Exceptions summary")
-st.write(f"- Shipments without exceptions: **{ex_none:,}**")
-st.write(f"- Shipments with exceptions: **{ex_yes:,}**")
-
-# Carrier table
-g = df.groupby("Current carrier", dropna=False)
-carrier_rows = []
-for carrier, dfx in g:
-    carrier = str(carrier).strip() if str(carrier).strip() else "Unknown"
-    carrier_rows.append([
-        carrier,
-        dfx["Shipment ID"].nunique(),
-        f"{dfx['All selected milestones reported'].mean()*100:.1f}%",
-        f"{dfx['All selected milestones on-time'].mean()*100:.1f}%",
-        f"{dfx['Has exceptions'].mean()*100:.1f}%",
-    ])
-carrier_table = pd.DataFrame(
-    carrier_rows, columns=["Carrier", "# Shipments", "Reporting %", "On-time %", "Exceptions %"]
-).sort_values("# Shipments", ascending=False)
-
-st.markdown("### Carrier view")
+st.subheader("Carrier-wise table")
 st.dataframe(carrier_table, use_container_width=True)
 
-# Lane table
-lg = df.groupby("Lane", dropna=False)
-lane_rows = []
-for lane, dfx in lg:
-    lane_rows.append([
-        str(lane),
-        dfx["Shipment ID"].nunique(),
-        f"{dfx['All selected milestones reported'].mean()*100:.1f}%",
-        f"{dfx['All selected milestones on-time'].mean()*100:.1f}%",
-    ])
-lane_table = pd.DataFrame(
-    lane_rows, columns=["Lane", "# Shipments", "Reporting %", "On-time %"]
-).sort_values("# Shipments", ascending=False)
+st.subheader("On-time performance (event-wise)")
+st.dataframe(otp_table, use_container_width=True)
 
-st.markdown("### Lane insights")
-st.dataframe(lane_table, use_container_width=True)
+if not lane_m_table.empty and not lane_o_table.empty:
+    st.subheader("Lane insights (top lanes by shipment volume)")
+    a, b = st.columns(2)
+    with a:
+        st.caption("Milestone reporting")
+        st.dataframe(lane_m_table.head(20), use_container_width=True)
+    with b:
+        st.caption("On-time performance")
+        st.dataframe(lane_o_table.head(20), use_container_width=True)
+else:
+    st.info("Lane insights will appear when Origin and Destination fields are populated.")
 
-# RCA summaries
-def rca_carrier_summary(df_rca: pd.DataFrame, rca_type: str) -> pd.DataFrame:
-    if df_rca.empty:
-        return pd.DataFrame(columns=["Carrier", "Affected shipments"])
+# -----------------------------
+# Build charts for PDF
+# -----------------------------
+charts = {}
 
-    df2 = df_rca.copy()
-    df2["Carrier"] = df2.get("Carrier", "").astype(str).replace("nan", "").fillna("Unknown")
-    df2["match_shipment_id"] = df2["match_shipment_id"].astype(str).replace("nan", "").fillna("")
+# milestone reporting chart
+if not milestone_table.empty:
+    s = milestone_table.set_index("Milestone")["Reported (%)"].fillna(0)
+    charts["milestone_reporting"] = bar_chart(s, "Milestone reporting (%)", ylabel="Percent")
 
-    # For tracking/milestone: must match shipment details
-    if rca_type in ["tracking", "milestone"]:
-        df2 = df2[df2["match_shipment_id"].isin(df["Shipment ID"].astype(str))].copy()
+# otp chart
+if not otp_table.empty:
+    s2 = otp_table.set_index("Event")["On-time (%)"].fillna(0)
+    charts["otp_by_event"] = bar_chart(s2, "On-time performance (%)", ylabel="Percent")
 
-    out = df2.groupby("Carrier", dropna=False)["match_shipment_id"].nunique().reset_index()
-    out.columns = ["Carrier", "Affected shipments"]
-    return out.sort_values("Affected shipments", ascending=False)
+# -----------------------------
+# PDF Export
+# -----------------------------
+# Date range label
+date_range_label = f"{start_date.strftime('%d %b %Y')} – {end_date.strftime('%d %b %Y')}"
+report_title = f"Monthly Business Review Report - {customer_name} - {date_range_label}"
 
-st.markdown("### RCA analysis (carrier-wise)")
-cA, cB, cC = st.columns(3)
-with cA:
-    st.write("**Creation RCA**")
-    st.dataframe(rca_carrier_summary(rca_creation_df, "creation"), use_container_width=True, height=260)
-with cB:
-    st.write("**Tracking RCA**")
-    st.dataframe(rca_carrier_summary(rca_tracking_df, "tracking"), use_container_width=True, height=260)
-with cC:
-    st.write("**Milestone RCA**")
-    st.dataframe(rca_carrier_summary(rca_milestone_df, "milestone"), use_container_width=True, height=260)
+# Logo bytes
+default_logo_path = "/mnt/data/p44_logo.png"  # provided in this environment; in Streamlit Cloud, you’ll upload it to repo
+logo_bytes = None
+if logo_up:
+    logo_bytes = logo_up.read()
+else:
+    try:
+        with open(default_logo_path, "rb") as f:
+            logo_bytes = f.read()
+    except Exception:
+        logo_bytes = None
 
-# PDF export
-st.divider()
-st.subheader("Export PDF (tables only)")
-
-logo_bytes = logo_file.getvalue() if logo_file else None
-date_range_label = f"{date_from.isoformat()} to {date_to.isoformat()}"
+screenshot_bytes = screenshot_up.read() if screenshot_up else None
 
 kpis = {
-    "shipments": f"{num_shipments:,}",
-    "carriers": f"{num_carriers:,}",
-    "reporting_pct": f"{reporting_all_pct:.1f}%",
-    "ontime_pct": f"{ontime_all_pct:.1f}%",
+    "num_shipments": num_shipments,
+    "num_carriers": num_carriers,
+    "num_all_selected": num_all_selected,
+    "pct_all_selected": pct_all_selected,
+    "num_marked_completed": num_marked_completed,
+    "num_timed_out": num_timed_out,
+    "contract_text": consumption_text,
+    "milestone_table": milestone_table,
 }
 
-rca_tables = {
-    "Creation issues – affected shipments by carrier": rca_carrier_summary(rca_creation_df, "creation"),
-    "Tracking issues – affected shipments by carrier": rca_carrier_summary(rca_tracking_df, "tracking"),
-    "Milestone issues – affected shipments by carrier": rca_carrier_summary(rca_milestone_df, "milestone"),
-}
+meta = ReportMeta(customer_name=customer_name, date_range_label=date_range_label, report_title=report_title)
 
-pdf_cfg = PdfConfig(
-    customer_name=customer_name,
-    date_range_label=date_range_label,
-    latency_minutes=int(latency_minutes),
-    selected_milestones=selected_milestones,
-    logo_bytes=logo_bytes,
-)
-
-if st.button("Generate PDF"):
-    pdf_bytes = build_pdf(
-        cfg=pdf_cfg,
+if st.button("Generate PDF Report"):
+    pdf_bytes = generate_pdf(
+        meta=meta,
         kpis=kpis,
-        contract={"contracted": float(contracted_volume), "billed": float(billed_volume)},
-        state_summary=state_summary,
-        milestone_reporting=milestone_reporting_df,
-        ontime_summary=ontime_df,
         carrier_table=carrier_table,
-        lane_table=lane_table,
-        rca_tables=rca_tables,
+        otp_table=otp_table.assign(
+            **{
+                "Destination ETA accurate (%)": [dest_est_pct] + [""] * (len(otp_table) - 1) if len(otp_table) else []
+            }
+        ),
+        lane_milestone_table=lane_m_table.head(12) if not lane_m_table.empty else pd.DataFrame({"Lane": [], "Shipments": [], "All selected milestones (%)": []}),
+        lane_otp_table=lane_o_table.head(12) if not lane_o_table.empty else pd.DataFrame({"Lane": [], "Shipments": [], "Avg OTP across selected events (%)": []}),
+        charts=charts,
+        logo_bytes=logo_bytes,
+        screenshot_bytes=screenshot_bytes,
     )
-    filename = f"Monthly Business Review Report - {customer_name} - {date_range_label}.pdf"
-    st.download_button("Download PDF", data=pdf_bytes, file_name=filename, mime="application/pdf")
+
+    st.success("PDF generated!")
+    st.download_button(
+        "Download PDF",
+        data=pdf_bytes,
+        file_name=f"{report_title}.pdf",
+        mime="application/pdf",
+    )
