@@ -21,6 +21,7 @@ from reportlab.platypus import (
     PageBreak,
 )
 from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase.pdfmetrics import stringWidth
 
 
 # -----------------------------
@@ -42,10 +43,10 @@ COLORS = {
     "kpi_pos_bg": colors.HexColor("#DCFCE7"),
     "kpi_risk_bg": colors.HexColor("#FEF3C7"),
     "kpi_crit_bg": colors.HexColor("#FEE2E2"),
+    "kpi_neutral_bg": colors.HexColor("#F8FAFC"),
 }
 
 PAGE_W, PAGE_H = landscape(A4)
-
 MARGINS_CONTENT = dict(left=24 * mm, right=20 * mm, top=18 * mm, bottom=18 * mm)
 
 
@@ -102,7 +103,7 @@ MILESTONES = {
 
 
 # -----------------------------
-# Utilities
+# Data utilities
 # -----------------------------
 def safe_to_datetime(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce", infer_datetime_format=True)
@@ -272,7 +273,7 @@ def kpi_bg_hex(consumption_ratio: float) -> str:
 
 
 # -----------------------------
-# PDF generation
+# PDF: Styles + Header/Footer
 # -----------------------------
 @dataclass
 class EmbeddedImage:
@@ -358,22 +359,31 @@ def build_styles():
             textColor=COLORS["text_secondary"],
         )
     )
+    base.add(
+        ParagraphStyle(
+            name="TinyNote",
+            fontName="Helvetica",
+            fontSize=9,
+            leading=11,
+            textColor=COLORS["text_secondary"],
+        )
+    )
     return base
 
 
 def draw_header_footer(canvas, doc, meta: ReportMeta, logo_bytes: Optional[bytes]):
     canvas.saveState()
 
-    # Header logo on the RIGHT, bigger
+    # Header logo RIGHT, bigger
     if logo_bytes:
         try:
             img = Image.open(io.BytesIO(logo_bytes)).convert("RGBA")
-            target_h = 16 * mm  # bigger than before
+            target_h = 16 * mm  # bigger
             ratio = img.width / img.height
             target_w = target_h * ratio
 
             x = PAGE_W - doc.rightMargin - target_w
-            y = PAGE_H - doc.topMargin + 6 * mm  # slightly above content
+            y = PAGE_H - doc.topMargin + 6 * mm
             canvas.drawImage(
                 ImageReader(io.BytesIO(logo_bytes)),
                 x,
@@ -388,7 +398,6 @@ def draw_header_footer(canvas, doc, meta: ReportMeta, logo_bytes: Optional[bytes
     # Footer
     canvas.setFont("Helvetica", 8.5)
     canvas.setFillColor(COLORS["text_muted"])
-
     y = doc.bottomMargin - 8 * mm
     canvas.drawString(doc.leftMargin, y, meta.customer_name)
     canvas.drawCentredString(PAGE_W / 2, y, "Confidential – Customer Use Only")
@@ -397,53 +406,184 @@ def draw_header_footer(canvas, doc, meta: ReportMeta, logo_bytes: Optional[bytes
     canvas.restoreState()
 
 
-def make_kpi_table(kpis: List[List[str]]) -> Table:
-    t = Table(kpis, colWidths=[90 * mm, 60 * mm])
-    t.setStyle(
+# -----------------------------
+# PDF: Auto-fit tables
+# -----------------------------
+def _calc_col_widths(df: pd.DataFrame, font_name: str, font_size: float, max_total_width: float) -> List[float]:
+    cols = list(df.columns)
+    sample = df.head(14).astype(str)
+
+    raw_widths = []
+    for c in cols:
+        header_w = stringWidth(str(c), font_name, font_size) + 10
+        cell_w = 0
+        if not sample.empty:
+            cell_w = max(stringWidth(v, font_name, font_size) for v in sample[c].tolist())
+        raw_widths.append(max(header_w, cell_w + 10))
+
+    total = sum(raw_widths)
+    if total <= max_total_width:
+        return raw_widths
+
+    scale = max_total_width / total if total else 1.0
+    return [w * scale for w in raw_widths]
+
+
+def auto_fit_table(
+    df: pd.DataFrame,
+    avail_w: float,
+    avail_h: float,
+    max_rows: int = 60,
+    min_font: float = 7.5,
+    max_font: float = 10.5,
+) -> Table:
+    show = df.copy()
+    if len(show) > max_rows:
+        show = show.head(max_rows).copy()
+
+    data = [list(show.columns)] + show.astype(str).values.tolist()
+
+    font_name_header = "Helvetica-Bold"
+    font_name_body = "Helvetica"
+
+    font_candidates = [max_font, 10.0, 9.5, 9.0, 8.5, 8.0, 7.5]
+    font_candidates = [fs for fs in font_candidates if fs >= min_font]
+
+    for fs in font_candidates:
+        pad = 6 if fs >= 10 else 5 if fs >= 9 else 4
+
+        col_widths = _calc_col_widths(show, font_name_body, fs, avail_w)
+
+        t = Table(data, colWidths=col_widths, repeatRows=1)
+
+        style_cmds = [
+            ("FONTNAME", (0, 0), (-1, 0), font_name_header),
+            ("FONTSIZE", (0, 0), (-1, 0), fs),
+            ("BACKGROUND", (0, 0), (-1, 0), COLORS["table_header_bg"]),
+            ("TEXTCOLOR", (0, 0), (-1, 0), COLORS["text_primary"]),
+            ("LINEBELOW", (0, 0), (-1, 0), 0.5, COLORS["divider"]),
+            ("FONTNAME", (0, 1), (-1, -1), font_name_body),
+            ("FONTSIZE", (0, 1), (-1, -1), fs - 0.5),
+            ("GRID", (0, 0), (-1, -1), 0.5, COLORS["divider"]),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), pad),
+            ("RIGHTPADDING", (0, 0), (-1, -1), pad),
+            ("TOPPADDING", (0, 0), (-1, -1), max(3, pad - 2)),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), max(3, pad - 2)),
+        ]
+
+        for r in range(1, len(data)):
+            bg = COLORS["row_alt"] if r % 2 == 0 else COLORS["bg"]
+            style_cmds.append(("BACKGROUND", (0, r), (-1, r), bg))
+
+        t.setStyle(TableStyle(style_cmds))
+
+        w, h = t.wrap(avail_w, avail_h)
+        if w <= avail_w + 1 and h <= avail_h + 1:
+            return t
+
+    # Hard fallback: tiny font + fewer rows
+    show2 = df.head(14).copy()
+    data2 = [list(show2.columns)] + show2.astype(str).values.tolist()
+    fs = min_font
+    col_widths = _calc_col_widths(show2, "Helvetica", fs, avail_w)
+    t2 = Table(data2, colWidths=col_widths, repeatRows=1)
+    t2.setStyle(
         TableStyle(
             [
-                ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
-                ("FONTSIZE", (0, 0), (-1, -1), 11),
-                ("TEXTCOLOR", (0, 0), (-1, -1), COLORS["text_primary"]),
-                ("BACKGROUND", (0, 0), (-1, -1), COLORS["bg"]),
-                ("LINEBELOW", (0, 0), (-1, -1), 0.5, COLORS["divider"]),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-                ("TOPPADDING", (0, 0), (-1, -1), 8),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, 0), fs),
+                ("BACKGROUND", (0, 0), (-1, 0), COLORS["table_header_bg"]),
+                ("GRID", (0, 0), (-1, -1), 0.5, COLORS["divider"]),
+                ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 1), (-1, -1), fs),
+                ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                ("TOPPADDING", (0, 0), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
             ]
         )
     )
-    return t
+    return t2
 
 
-def styled_table(df: pd.DataFrame, max_rows: int = 14) -> Table:
-    show = df.head(max_rows).copy()
-    data = [list(show.columns)] + show.astype(str).values.tolist()
-    t = Table(data, repeatRows=1)
+# -----------------------------
+# PDF: KPI Tiles (cards)
+# -----------------------------
+def kpi_tiles(kpis: List[Dict], content_w: float, tiles_per_row: int = 4) -> Table:
+    """
+    kpis: [{"label": "...", "value": "...", "tone": "neutral|pos|amber|critical"}]
+    """
+    styles = getSampleStyleSheet()
+    label_style = styles["BodyText"]
+    value_style = styles["BodyText"]
 
-    style_cmds = [
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, 0), 10.5),
-        ("BACKGROUND", (0, 0), (-1, 0), COLORS["table_header_bg"]),
-        ("TEXTCOLOR", (0, 0), (-1, 0), COLORS["text_primary"]),
-        ("LINEBELOW", (0, 0), (-1, 0), 0.5, COLORS["divider"]),
-        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-        ("FONTSIZE", (0, 1), (-1, -1), 10),
-        ("GRID", (0, 0), (-1, -1), 0.5, COLORS["divider"]),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ]
+    tile_w = (content_w - ((tiles_per_row - 1) * 6)) / tiles_per_row  # small gutter
+    col_widths = [tile_w] * tiles_per_row
 
-    for r in range(1, len(data)):
-        bg = COLORS["row_alt"] if r % 2 == 0 else COLORS["bg"]
-        style_cmds.append(("BACKGROUND", (0, r), (-1, r), bg))
+    rows = []
+    current_row = []
 
-    t.setStyle(TableStyle(style_cmds))
-    return t
+    for i, k in enumerate(kpis, start=1):
+        tone = k.get("tone", "neutral")
+        if tone == "pos":
+            bg = COLORS["kpi_pos_bg"]
+        elif tone == "amber":
+            bg = COLORS["kpi_risk_bg"]
+        elif tone == "critical":
+            bg = COLORS["kpi_crit_bg"]
+        else:
+            bg = COLORS["kpi_neutral_bg"]
+
+        label = Paragraph(f"<font size='9' color='#4B5563'>{k['label']}</font>", label_style)
+        value = Paragraph(f"<font size='18'><b>{k['value']}</b></font>", value_style)
+
+        cell_tbl = Table([[label], [Spacer(1, 2)], [value]], colWidths=[tile_w])
+        cell_tbl.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, -1), bg),
+                    ("BOX", (0, 0), (-1, -1), 0.7, COLORS["divider"]),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+                    ("TOPPADDING", (0, 0), (-1, -1), 9),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
+                ]
+            )
+        )
+
+        current_row.append(cell_tbl)
+
+        if len(current_row) == tiles_per_row:
+            rows.append(current_row)
+            current_row = []
+
+    if current_row:
+        # pad empty tiles
+        while len(current_row) < tiles_per_row:
+            current_row.append(Spacer(1, 1))
+        rows.append(current_row)
+
+    outer = Table(rows, colWidths=col_widths, hAlign="LEFT")
+    outer.setStyle(
+        TableStyle(
+            [
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ROWSPACING", (0, 0), (-1, -1), 6),
+                ("COLSPACING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+    return outer
 
 
+# -----------------------------
+# PDF: Image fit
+# -----------------------------
 def fit_image_to_content(image_bytes: bytes, content_w: float, content_h: float) -> RLImage:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     ratio = img.width / img.height
@@ -457,9 +597,13 @@ def fit_image_to_content(image_bytes: bytes, content_w: float, content_h: float)
     return RLImage(io.BytesIO(image_bytes), width=target_w, height=target_h)
 
 
+# -----------------------------
+# PDF generation
+# -----------------------------
 def generate_pdf(
     meta: ReportMeta,
-    kpi_block: List[List[str]],
+    kpi_list: List[Dict],
+    contract_consumption_text: str,
     manual_summary_text: str,
     tables_in_order: List[Dict],
     embedded_images: List[EmbeddedImage],
@@ -481,6 +625,9 @@ def generate_pdf(
 
     story = []
 
+    content_w = PAGE_W - (MARGINS_CONTENT["left"] + MARGINS_CONTENT["right"])
+    content_h = PAGE_H - (MARGINS_CONTENT["top"] + MARGINS_CONTENT["bottom"])
+
     # Cover
     story.append(Spacer(1, 18 * mm))
     story.append(Paragraph("Monthly Business Review Report", styles["CoverTitle"]))
@@ -490,16 +637,21 @@ def generate_pdf(
     story.append(Paragraph("Prepared for external sharing", styles["Muted"]))
     story.append(PageBreak())
 
-    # Executive Summary (no charts, just KPI + optional manual text)
+    # Executive Summary: KPI tiles + contract + manual narrative
     story.append(Paragraph("Executive Summary", styles["H1"]))
     story.append(Paragraph("High-level KPIs and reporting performance overview.", styles["Body"]))
     story.append(Spacer(1, 8 * mm))
-    story.append(make_kpi_table(kpi_block))
+
+    story.append(kpi_tiles(kpi_list, content_w, tiles_per_row=4))
     story.append(Spacer(1, 8 * mm))
+
+    # Contract Consumption card-like paragraph
+    story.append(Paragraph("Contract Consumption", styles["H2"]))
+    story.append(Paragraph(contract_consumption_text, styles["Body"]))
+    story.append(Spacer(1, 6 * mm))
 
     if manual_summary_text.strip():
         story.append(Paragraph("Narrative Summary", styles["H2"]))
-        # split into paragraphs so it wraps nicely
         for para in manual_summary_text.strip().split("\n"):
             if para.strip():
                 story.append(Paragraph(para.strip(), styles["Body"]))
@@ -507,40 +659,53 @@ def generate_pdf(
 
     story.append(PageBreak())
 
-    # One table per page
+    # One table per page, auto-fit to page height
+    # Reserve some height for title/subtitle on each table page
+    table_avail_h = content_h - (28 * mm)  # for header text space
+    table_avail_w = content_w
+
     for item in tables_in_order:
         title = item.get("title", "Table")
         subtitle = item.get("subtitle", "")
         df = item.get("df", pd.DataFrame())
-        max_rows = item.get("max_rows", 14)
+        max_rows = item.get("max_rows", 60)
 
         story.append(Paragraph(title, styles["H1"]))
         if subtitle:
             story.append(Paragraph(subtitle, styles["Body"]))
-            story.append(Spacer(1, 4 * mm))
+        story.append(Spacer(1, 4 * mm))
 
-        story.append(styled_table(df, max_rows=max_rows))
+        if df is None or df.empty:
+            story.append(Paragraph("No data available for this view based on current filters.", styles["Body"]))
+        else:
+            # auto-fit table to available area
+            t = auto_fit_table(df, avail_w=table_avail_w, avail_h=table_avail_h, max_rows=max_rows)
+            story.append(t)
+
+            if len(df) > max_rows:
+                story.append(Spacer(1, 2 * mm))
+                story.append(Paragraph(f"Note: showing first {max_rows} rows to fit the page.", styles["TinyNote"]))
+
         story.append(PageBreak())
 
-    # Embedded images: each gets its own page + header + subtitle
+    # Embedded images: each on its own page with header + subtitle
     if embedded_images:
-        content_w = PAGE_W - (MARGINS_CONTENT["left"] + MARGINS_CONTENT["right"])
-        content_h = PAGE_H - (MARGINS_CONTENT["top"] + MARGINS_CONTENT["bottom"] + 22 * mm)
+        img_avail_h = content_h - (34 * mm)  # allow header + subtitle
+        img_avail_w = content_w
 
         for ei in embedded_images:
             story.append(Paragraph(ei.header or "Embedded Image", styles["H1"]))
             if ei.subtitle:
                 story.append(Paragraph(ei.subtitle, styles["Body"]))
-                story.append(Spacer(1, 6 * mm))
+            story.append(Spacer(1, 6 * mm))
 
-            story.append(fit_image_to_content(ei.bytes_, content_w, content_h))
+            story.append(fit_image_to_content(ei.bytes_, img_avail_w, img_avail_h))
             story.append(PageBreak())
 
     def on_page(canvas, doc_):
         draw_header_footer(canvas, doc_, meta, logo_bytes)
 
     doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
-
     buf.seek(0)
     return buf.read()
 
@@ -550,7 +715,7 @@ def generate_pdf(
 # -----------------------------
 st.set_page_config(page_title="Monthly Business Review Report", layout="wide")
 st.title("Monthly Business Review Report Builder")
-st.caption("Upload your shipment file, filter, review the dashboard tables, and export a formatted PDF (tables only).")
+st.caption("Upload your shipment file, filter, review tables, and export a formatted PDF (auto-fit tables & images).")
 
 with st.sidebar:
     st.header("1) Upload")
@@ -565,19 +730,19 @@ with st.sidebar:
     st.divider()
     st.header("3) Manual PDF Summary")
     manual_summary = st.text_area(
-        "Type a short executive summary (this will be included in the PDF)",
-        placeholder="Example:\n- Reporting improved vs last month\n- Key gaps remain on Arrival at Destination\n- OTP is below target on Lane A → B",
+        "Type an executive summary (included in PDF)",
+        placeholder="Example:\n- Reporting improved vs last month\n- Key gaps remain on Arrival at Destination\n- OTP below target on Lane A → B",
         height=180,
     )
 
     st.divider()
     st.header("4) Assets")
-    st.caption("Logo: defaults to project44 if not provided.")
+    st.caption("Logo: defaults to repo logo if present (assets/p44_logo.png), else upload here.")
     logo_up = st.file_uploader("Upload logo (PNG)", type=["png"], key="logo")
 
     st.caption("Embedded images (multiple). Each image becomes a separate PDF page.")
     embedded_files = st.file_uploader(
-        "Upload images to embed (PNG/JPG) — you can select multiple",
+        "Upload images to embed (PNG/JPG) — select multiple",
         type=["png", "jpg", "jpeg"],
         accept_multiple_files=True,
         key="embeds",
@@ -634,13 +799,16 @@ with colB:
 start_ts = pd.Timestamp(start_date)
 end_ts = pd.Timestamp(end_date) + pd.Timedelta(hours=23, minutes=59, seconds=59)
 
-carriers = sorted([c for c in df["Current carrier"].dropna().unique().tolist() if str(c).strip() != ""]) if "Current carrier" in df.columns else []
+carriers = sorted(
+    [c for c in df["Current carrier"].dropna().unique().tolist() if str(c).strip() != ""]
+) if "Current carrier" in df.columns else []
 selected_carriers = st.multiselect("Carriers", options=carriers, default=carriers[: min(len(carriers), 10)])
 
 fdf = df.copy()
 fdf = apply_include_exclude_filter(fdf, date_col, start_ts, end_ts, date_mode)
 fdf = apply_include_exclude_list(fdf, "Current carrier", selected_carriers, carrier_mode)
 
+# Core metrics
 all_selected_mask = all_selected_reported_mask(fdf, selected_milestones)
 num_shipments = fdf["Shipment ID"].nunique() if "Shipment ID" in fdf.columns else len(fdf)
 num_carriers = fdf["Current carrier"].nunique() if "Current carrier" in fdf.columns else 0
@@ -650,6 +818,7 @@ pct_all_selected = (num_all_selected / num_shipments * 100) if num_shipments els
 num_marked_completed = int((fdf["Current state"] == "COMPLETED").sum()) if "Current state" in fdf.columns else 0
 num_timed_out = int((fdf["Completion Bucket"] == "Timed Out").sum()) if "Completion Bucket" in fdf.columns else 0
 
+# Exceptions
 exceptions_series = fdf["Exceptions"] if "Exceptions" in fdf.columns else pd.Series([""] * len(fdf))
 no_exc = int((exceptions_series.fillna("").str.strip() == "").sum())
 with_exc = len(fdf) - no_exc
@@ -662,6 +831,7 @@ exc_counts = (
     .value_counts()
 )
 
+# Milestone reporting table
 milestone_rows = []
 for m in selected_milestones:
     rep = reported_mask(fdf, m)
@@ -674,6 +844,7 @@ for m in selected_milestones:
     )
 milestone_table = pd.DataFrame(milestone_rows)
 
+# OTP table
 otp_rows = []
 for m in selected_milestones:
     rep = reported_mask(fdf, m)
@@ -689,6 +860,7 @@ for m in selected_milestones:
     )
 otp_table = pd.DataFrame(otp_rows)
 
+# Destination estimated accuracy
 dest_est_acc = estimated_accuracy_mask(fdf, "Arrival at Destination", latency_minutes)
 dest_est_assessable = int(
     (fdf[MILESTONES["Arrival at Destination"]["actual"]].notna() & fdf[MILESTONES["Arrival at Destination"]["estimated"]].notna()).sum()
@@ -699,6 +871,7 @@ dest_est_assessable = int(
 dest_est_accurate = int(dest_est_acc.sum())
 dest_est_pct = round((dest_est_accurate / dest_est_assessable * 100), 1) if dest_est_assessable else None
 
+# Carrier table
 carrier_group = []
 if "Current carrier" in fdf.columns and "Shipment ID" in fdf.columns:
     for carrier, g in fdf.groupby("Current carrier"):
@@ -714,6 +887,7 @@ if "Current carrier" in fdf.columns and "Shipment ID" in fdf.columns:
         )
 carrier_table = pd.DataFrame(carrier_group).sort_values("Shipments", ascending=False)
 
+# Lane tables
 lane_m_table = pd.DataFrame()
 lane_o_table = pd.DataFrame()
 if "Lane" in fdf.columns and "Shipment ID" in fdf.columns and fdf["Lane"].astype(str).str.strip().ne("").any():
@@ -750,6 +924,7 @@ if "Lane" in fdf.columns and "Shipment ID" in fdf.columns and fdf["Lane"].astype
         )
     lane_o_table = pd.DataFrame(lane_o_group).sort_values("Shipments", ascending=False)
 
+# Contract consumption
 consumption_ratio = (billed_volume / contracted_volume) if contracted_volume else float("inf")
 consumption_text = (
     f"Contracted: {contracted_volume:,.0f} | Billed: {billed_volume:,.0f} | "
@@ -783,7 +958,6 @@ color:#1F2933;">
 )
 
 st.divider()
-
 st.subheader("Milestone reporting (selected)")
 st.dataframe(milestone_table, use_container_width=True)
 
@@ -804,41 +978,49 @@ if not lane_m_table.empty:
         st.dataframe(lane_o_table.head(20), use_container_width=True)
 
 # -----------------------------
-# Embedded image metadata UI
+# Embedded images metadata UI
 # -----------------------------
 embedded_images: List[EmbeddedImage] = []
 if embedded_files:
     st.subheader("Embedded images setup (for PDF)")
-    st.caption("For each image, provide a page header and a subtitle. Each will become its own PDF page.")
+    st.caption("For each image, provide a page header and a subtitle. Each becomes its own PDF page.")
     for i, f in enumerate(embedded_files, start=1):
         col1, col2 = st.columns([1, 1])
         with col1:
             header = st.text_input(f"Image {i} page header", value=f.name, key=f"img_head_{i}")
         with col2:
-            subtitle = st.text_input(f"Image {i} subtitle", value="(optional)", key=f"img_sub_{i}")
+            subtitle = st.text_input(f"Image {i} subtitle", value="", key=f"img_sub_{i}")
         st.image(f, caption=f"Preview: {f.name}", use_container_width=True)
-        embedded_images.append(EmbeddedImage(header=header, subtitle=subtitle if subtitle != "(optional)" else "", bytes_=f.read()))
+        embedded_images.append(EmbeddedImage(header=header, subtitle=subtitle, bytes_=f.getvalue()))
 
 # -----------------------------
 # PDF Export
 # -----------------------------
 date_range_label = f"{start_date.strftime('%d %b %Y')} – {end_date.strftime('%d %b %Y')}"
 report_title = f"Monthly Business Review Report - {customer_name} - {date_range_label}"
-
-# Logo bytes: prefer uploaded, else fallback to repo file if you add it.
-logo_bytes = logo_up.read() if logo_up else None
-
 meta = ReportMeta(customer_name=customer_name, date_range_label=date_range_label, report_title=report_title)
 
-kpi_block = [
-    ["Number of Shipments", fmt_int(num_shipments)],
-    ["Number of Carriers", fmt_int(num_carriers)],
-    ["Shipments reporting ALL selected milestones", fmt_int(num_all_selected)],
-    ["% reporting ALL selected milestones", fmt_pct(pct_all_selected)],
-    ["Marked Completed", fmt_int(num_marked_completed)],
-    ["Timed Out (per rule)", fmt_int(num_timed_out)],
-    ["Destination ETA accurate (assessable)", f"{dest_est_accurate:,} / {dest_est_assessable:,} ({fmt_pct(dest_est_pct)})"],
-    ["Contract Consumption", consumption_text],
+# Logo bytes: upload takes precedence; else fallback to assets/p44_logo.png if present in repo
+logo_bytes = None
+if logo_up:
+    logo_bytes = logo_up.getvalue()
+else:
+    try:
+        with open("assets/p44_logo.png", "rb") as f:
+            logo_bytes = f.read()
+    except Exception:
+        logo_bytes = None
+
+# KPI tiles list (tone can be used for background)
+kpi_list = [
+    {"label": "Number of Shipments", "value": fmt_int(num_shipments), "tone": "neutral"},
+    {"label": "Number of Carriers", "value": fmt_int(num_carriers), "tone": "neutral"},
+    {"label": "All selected milestones (#)", "value": fmt_int(num_all_selected), "tone": "neutral"},
+    {"label": "All selected milestones (%)", "value": fmt_pct(pct_all_selected), "tone": "neutral"},
+    {"label": "Marked Completed", "value": fmt_int(num_marked_completed), "tone": "pos"},
+    {"label": "Timed Out (per rule)", "value": fmt_int(num_timed_out), "tone": "amber" if num_timed_out else "pos"},
+    {"label": "No Exceptions", "value": fmt_int(no_exc), "tone": "pos"},
+    {"label": "With Exceptions", "value": fmt_int(with_exc), "tone": "amber" if with_exc else "pos"},
 ]
 
 tables_in_order = [
@@ -846,19 +1028,19 @@ tables_in_order = [
         "title": "Milestone Reporting",
         "subtitle": "Reporting counts and percentages for selected milestones.",
         "df": milestone_table,
-        "max_rows": 14,
+        "max_rows": 60,
     },
     {
         "title": "Carrier-wise Summary",
         "subtitle": "Shipments and reporting performance by carrier.",
         "df": carrier_table,
-        "max_rows": 14,
+        "max_rows": 60,
     },
     {
         "title": "On-time Performance (OTP)",
         "subtitle": f"On-time uses latest planned END time + {latency_minutes} minutes latency.",
         "df": otp_table,
-        "max_rows": 14,
+        "max_rows": 60,
     },
 ]
 
@@ -867,8 +1049,8 @@ if not lane_m_table.empty:
         {
             "title": "Lane Insights — Milestone Reporting",
             "subtitle": "Top lanes by shipment volume.",
-            "df": lane_m_table.head(50),
-            "max_rows": 14,
+            "df": lane_m_table.head(200),
+            "max_rows": 60,
         }
     )
 
@@ -877,20 +1059,55 @@ if not lane_o_table.empty:
         {
             "title": "Lane Insights — On-time Performance",
             "subtitle": "Top lanes by shipment volume.",
-            "df": lane_o_table.head(50),
-            "max_rows": 14,
+            "df": lane_o_table.head(200),
+            "max_rows": 60,
         }
     )
+
+# Add exception breakdown table if you want it in PDF as well
+if not exc_counts.empty:
+    exc_table = exc_counts.reset_index()
+    exc_table.columns = ["Exception", "Count"]
+    tables_in_order.append(
+        {
+            "title": "Exceptions Breakdown",
+            "subtitle": "Exception-wise distribution (non-empty exceptions).",
+            "df": exc_table,
+            "max_rows": 60,
+        }
+    )
+
+# Add destination estimated accuracy as a tiny table page (optional)
+dest_acc_df = pd.DataFrame(
+    [
+        {
+            "Metric": "Destination ETA accuracy (abs(actual - estimated) <= latency)",
+            "Accurate (#)": dest_est_accurate,
+            "Assessable (#)": dest_est_assessable,
+            "Accurate (%)": dest_est_pct,
+        }
+    ]
+)
+tables_in_order.append(
+    {
+        "title": "Destination ETA Accuracy",
+        "subtitle": f"Latency threshold = {latency_minutes} minutes.",
+        "df": dest_acc_df,
+        "max_rows": 10,
+    }
+)
 
 if st.button("Generate PDF Report"):
     pdf_bytes = generate_pdf(
         meta=meta,
-        kpi_block=kpi_block,
+        kpi_list=kpi_list,
+        contract_consumption_text=consumption_text,
         manual_summary_text=manual_summary,
         tables_in_order=tables_in_order,
         embedded_images=embedded_images,
         logo_bytes=logo_bytes,
     )
+
     st.success("PDF generated!")
     st.download_button(
         "Download PDF",
