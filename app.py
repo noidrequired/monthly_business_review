@@ -1,7 +1,7 @@
 import io
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -19,6 +19,7 @@ from reportlab.platypus import (
     TableStyle,
     Image as RLImage,
     PageBreak,
+    KeepTogether,
 )
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase.pdfmetrics import stringWidth
@@ -250,13 +251,13 @@ def estimated_accuracy_mask(df: pd.DataFrame, milestone_name: str, latency_minut
 
 
 def fmt_pct(x: float) -> str:
-    if pd.isna(x):
+    if pd.isna(x) or x is None:
         return "—"
     return f"{x:.1f}%"
 
 
 def fmt_int(x) -> str:
-    if pd.isna(x):
+    if pd.isna(x) or x is None:
         return "—"
     try:
         return f"{int(x):,}"
@@ -273,7 +274,7 @@ def kpi_bg_hex(consumption_ratio: float) -> str:
 
 
 # -----------------------------
-# PDF: Styles + Header/Footer
+# PDF: Dataclasses + styles + header/footer
 # -----------------------------
 @dataclass
 class EmbeddedImage:
@@ -290,9 +291,9 @@ class ReportMeta:
 
 
 def build_styles():
-    base = getSampleStyleSheet()
+    base_toggle = getSampleStyleSheet()
 
-    base.add(
+    base_toggle.add(
         ParagraphStyle(
             name="H1",
             fontName="Helvetica-Bold",
@@ -302,35 +303,25 @@ def build_styles():
             spaceAfter=10,
         )
     )
-    base.add(
-        ParagraphStyle(
-            name="H2",
-            fontName="Helvetica-Bold",
-            fontSize=16,
-            leading=20,
-            textColor=COLORS["text_primary"],
-            spaceAfter=8,
-        )
-    )
-    base.add(
+    base_toggle.add(
         ParagraphStyle(
             name="Body",
             fontName="Helvetica",
-            fontSize=11,
-            leading=15,
+            fontSize=12,
+            leading=16,
             textColor=COLORS["text_primary"],
         )
     )
-    base.add(
+    base_toggle.add(
         ParagraphStyle(
             name="Muted",
             fontName="Helvetica",
-            fontSize=9.5,
-            leading=12,
+            fontSize=10,
+            leading=13,
             textColor=COLORS["text_secondary"],
         )
     )
-    base.add(
+    base_toggle.add(
         ParagraphStyle(
             name="CoverTitle",
             fontName="Helvetica-Bold",
@@ -340,7 +331,7 @@ def build_styles():
             spaceAfter=14,
         )
     )
-    base.add(
+    base_toggle.add(
         ParagraphStyle(
             name="CoverSub",
             fontName="Helvetica-Bold",
@@ -350,7 +341,7 @@ def build_styles():
             spaceAfter=10,
         )
     )
-    base.add(
+    base_toggle.add(
         ParagraphStyle(
             name="CoverSmall",
             fontName="Helvetica",
@@ -359,7 +350,7 @@ def build_styles():
             textColor=COLORS["text_secondary"],
         )
     )
-    base.add(
+    base_toggle.add(
         ParagraphStyle(
             name="TinyNote",
             fontName="Helvetica",
@@ -368,22 +359,22 @@ def build_styles():
             textColor=COLORS["text_secondary"],
         )
     )
-    return base
+    return base_toggle
 
 
 def draw_header_footer(canvas, doc, meta: ReportMeta, logo_bytes: Optional[bytes]):
     canvas.saveState()
 
-    # Header logo RIGHT, bigger
+    # Header logo RIGHT, larger
     if logo_bytes:
         try:
             img = Image.open(io.BytesIO(logo_bytes)).convert("RGBA")
-            target_h = 16 * mm  # bigger
+            target_h = 18 * mm  # bigger and cleaner
             ratio = img.width / img.height
             target_w = target_h * ratio
 
             x = PAGE_W - doc.rightMargin - target_w
-            y = PAGE_H - doc.topMargin + 6 * mm
+            y = PAGE_H - doc.topMargin + 7 * mm
             canvas.drawImage(
                 ImageReader(io.BytesIO(logo_bytes)),
                 x,
@@ -407,19 +398,19 @@ def draw_header_footer(canvas, doc, meta: ReportMeta, logo_bytes: Optional[bytes
 
 
 # -----------------------------
-# PDF: Auto-fit tables
+# PDF: Auto-fit tables (NOW scales UP for small tables)
 # -----------------------------
 def _calc_col_widths(df: pd.DataFrame, font_name: str, font_size: float, max_total_width: float) -> List[float]:
     cols = list(df.columns)
-    sample = df.head(14).astype(str)
+    sample = df.head(18).astype(str)
 
     raw_widths = []
     for c in cols:
-        header_w = stringWidth(str(c), font_name, font_size) + 10
+        header_w = stringWidth(str(c), font_name, font_size) + 12
         cell_w = 0
         if not sample.empty:
             cell_w = max(stringWidth(v, font_name, font_size) for v in sample[c].tolist())
-        raw_widths.append(max(header_w, cell_w + 10))
+        raw_widths.append(max(header_w, cell_w + 12))
 
     total = sum(raw_widths)
     if total <= max_total_width:
@@ -429,31 +420,54 @@ def _calc_col_widths(df: pd.DataFrame, font_name: str, font_size: float, max_tot
     return [w * scale for w in raw_widths]
 
 
-def auto_fit_table(
+def auto_fit_table_dynamic(
     df: pd.DataFrame,
     avail_w: float,
     avail_h: float,
-    max_rows: int = 60,
+    max_rows: int = 80,
     min_font: float = 7.5,
-    max_font: float = 10.5,
-) -> Table:
+    max_font: float = 14.0,
+) -> Tuple[Table, bool]:
+    """
+    Returns: (table, truncated_flag)
+    - Tries LARGE fonts first so small tables look 'page-worthy'
+    - Shrinks as needed to avoid overflow
+    - If still too tall, truncates rows (one-page rule)
+    """
+    truncated = False
     show = df.copy()
     if len(show) > max_rows:
         show = show.head(max_rows).copy()
+        truncated = True
 
     data = [list(show.columns)] + show.astype(str).values.tolist()
 
     font_name_header = "Helvetica-Bold"
     font_name_body = "Helvetica"
 
-    font_candidates = [max_font, 10.0, 9.5, 9.0, 8.5, 8.0, 7.5]
-    font_candidates = [fs for fs in font_candidates if fs >= min_font]
+    # Try from big -> small (so small tables become nicely large)
+    font_candidates = [14.0, 13.0, 12.0, 11.0, 10.5, 10.0, 9.5, 9.0, 8.5, 8.0, 7.5]
+    font_candidates = [fs for fs in font_candidates if min_font <= fs <= max_font]
 
     for fs in font_candidates:
-        pad = 6 if fs >= 10 else 5 if fs >= 9 else 4
+        # padding rises with bigger font
+        if fs >= 13:
+            pad = 9
+            vpad = 7
+        elif fs >= 12:
+            pad = 8
+            vpad = 6
+        elif fs >= 11:
+            pad = 7
+            vpad = 5
+        elif fs >= 10:
+            pad = 6
+            vpad = 4
+        else:
+            pad = 5
+            vpad = 3
 
         col_widths = _calc_col_widths(show, font_name_body, fs, avail_w)
-
         t = Table(data, colWidths=col_widths, repeatRows=1)
 
         style_cmds = [
@@ -461,15 +475,15 @@ def auto_fit_table(
             ("FONTSIZE", (0, 0), (-1, 0), fs),
             ("BACKGROUND", (0, 0), (-1, 0), COLORS["table_header_bg"]),
             ("TEXTCOLOR", (0, 0), (-1, 0), COLORS["text_primary"]),
-            ("LINEBELOW", (0, 0), (-1, 0), 0.5, COLORS["divider"]),
+            ("LINEBELOW", (0, 0), (-1, 0), 0.8, COLORS["divider"]),
             ("FONTNAME", (0, 1), (-1, -1), font_name_body),
             ("FONTSIZE", (0, 1), (-1, -1), fs - 0.5),
-            ("GRID", (0, 0), (-1, -1), 0.5, COLORS["divider"]),
+            ("GRID", (0, 0), (-1, -1), 0.7, COLORS["divider"]),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("LEFTPADDING", (0, 0), (-1, -1), pad),
             ("RIGHTPADDING", (0, 0), (-1, -1), pad),
-            ("TOPPADDING", (0, 0), (-1, -1), max(3, pad - 2)),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), max(3, pad - 2)),
+            ("TOPPADDING", (0, 0), (-1, -1), vpad),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), vpad),
         ]
 
         for r in range(1, len(data)):
@@ -480,10 +494,11 @@ def auto_fit_table(
 
         w, h = t.wrap(avail_w, avail_h)
         if w <= avail_w + 1 and h <= avail_h + 1:
-            return t
+            return t, truncated
 
-    # Hard fallback: tiny font + fewer rows
-    show2 = df.head(14).copy()
+    # If it still doesn't fit, truncate more aggressively and use smallest font
+    truncated = True
+    show2 = df.head(18).copy()
     data2 = [list(show2.columns)] + show2.astype(str).values.tolist()
     fs = min_font
     col_widths = _calc_col_widths(show2, "Helvetica", fs, avail_w)
@@ -494,77 +509,111 @@ def auto_fit_table(
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                 ("FONTSIZE", (0, 0), (-1, 0), fs),
                 ("BACKGROUND", (0, 0), (-1, 0), COLORS["table_header_bg"]),
-                ("GRID", (0, 0), (-1, -1), 0.5, COLORS["divider"]),
+                ("GRID", (0, 0), (-1, -1), 0.6, COLORS["divider"]),
                 ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
                 ("FONTSIZE", (0, 1), (-1, -1), fs),
-                ("LEFTPADDING", (0, 0), (-1, -1), 3),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-                ("TOPPADDING", (0, 0), (-1, -1), 2),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
             ]
         )
     )
-    return t2
+    return t2, truncated
 
 
-# -----------------------------
-# PDF: KPI Tiles (cards)
-# -----------------------------
-def kpi_tiles(kpis: List[Dict], content_w: float, tiles_per_row: int = 4) -> Table:
+def centered_flowable(flowable, avail_h: float, flowable_h: float) -> List:
     """
-    kpis: [{"label": "...", "value": "...", "tone": "neutral|pos|amber|critical"}]
+    Adds spacers above/below to center the flowable vertically within avail_h.
+    """
+    free = max(0, avail_h - flowable_h)
+    top = free * 0.18  # slightly top-biased so it feels more 'designed'
+    bottom = free - top
+    return [Spacer(1, top), flowable, Spacer(1, bottom)]
+
+
+# -----------------------------
+# PDF: KPI Tiles (clean grid, label top-left, value centered)
+# -----------------------------
+def kpi_tiles_grid(kpis: List[Dict], content_w: float, cols: int = 4) -> Table:
+    """
+    kpis item format:
+      {
+        "label": str,
+        "value": str,
+        "tone": "neutral|pos|amber|critical",
+        "subvalue": Optional[str]  # small line under centered value (optional)
+      }
     """
     styles = getSampleStyleSheet()
     label_style = styles["BodyText"]
     value_style = styles["BodyText"]
+    sub_style = styles["BodyText"]
 
-    tile_w = (content_w - ((tiles_per_row - 1) * 6)) / tiles_per_row  # small gutter
-    col_widths = [tile_w] * tiles_per_row
+    gutter = 6
+    tile_w = (content_w - ((cols - 1) * gutter)) / cols
 
-    rows = []
-    current_row = []
-
-    for i, k in enumerate(kpis, start=1):
-        tone = k.get("tone", "neutral")
+    def tile_bg(tone: str):
         if tone == "pos":
-            bg = COLORS["kpi_pos_bg"]
-        elif tone == "amber":
-            bg = COLORS["kpi_risk_bg"]
-        elif tone == "critical":
-            bg = COLORS["kpi_crit_bg"]
+            return COLORS["kpi_pos_bg"]
+        if tone == "amber":
+            return COLORS["kpi_risk_bg"]
+        if tone == "critical":
+            return COLORS["kpi_crit_bg"]
+        return COLORS["kpi_neutral_bg"]
+
+    tiles: List = []
+    for k in kpis:
+        label = Paragraph(f"<font size='10' color='#4B5563'>{k['label']}</font>", label_style)
+        value = Paragraph(f"<para alignment='center'><font size='24'><b>{k['value']}</b></font></para>", value_style)
+
+        sub = None
+        if k.get("subvalue"):
+            sub = Paragraph(f"<para alignment='center'><font size='10' color='#4B5563'>{k['subvalue']}</font></para>", sub_style)
+
+        # Build a fixed-height tile using 3 rows: label / spacer / centered value(+sub)
+        inner_rows = []
+        inner_rows.append([label])
+        inner_rows.append([Spacer(1, 10)])  # breathing room
+
+        if sub:
+            inner_rows.append([value])
+            inner_rows.append([Spacer(1, 4)])
+            inner_rows.append([sub])
         else:
-            bg = COLORS["kpi_neutral_bg"]
+            inner_rows.append([value])
 
-        label = Paragraph(f"<font size='9' color='#4B5563'>{k['label']}</font>", label_style)
-        value = Paragraph(f"<font size='18'><b>{k['value']}</b></font>", value_style)
-
-        cell_tbl = Table([[label], [Spacer(1, 2)], [value]], colWidths=[tile_w])
-        cell_tbl.setStyle(
+        inner = Table(inner_rows, colWidths=[tile_w])
+        inner.setStyle(
             TableStyle(
                 [
-                    ("BACKGROUND", (0, 0), (-1, -1), bg),
-                    ("BOX", (0, 0), (-1, -1), 0.7, COLORS["divider"]),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 10),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-                    ("TOPPADDING", (0, 0), (-1, -1), 9),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
+                    ("BACKGROUND", (0, 0), (-1, -1), tile_bg(k.get("tone", "neutral"))),
+                    ("BOX", (0, 0), (-1, -1), 0.8, COLORS["divider"]),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 12),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+                    ("TOPPADDING", (0, 0), (-1, -1), 12),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 12),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ]
             )
         )
+        tiles.append(inner)
 
-        current_row.append(cell_tbl)
+    # Arrange into grid
+    rows = []
+    row = []
+    for i, t in enumerate(tiles, start=1):
+        row.append(t)
+        if len(row) == cols:
+            rows.append(row)
+            row = []
+    if row:
+        # pad remaining
+        while len(row) < cols:
+            row.append(Spacer(1, 1))
+        rows.append(row)
 
-        if len(current_row) == tiles_per_row:
-            rows.append(current_row)
-            current_row = []
-
-    if current_row:
-        # pad empty tiles
-        while len(current_row) < tiles_per_row:
-            current_row.append(Spacer(1, 1))
-        rows.append(current_row)
-
-    outer = Table(rows, colWidths=col_widths, hAlign="LEFT")
+    outer = Table(rows, colWidths=[tile_w] * cols, hAlign="LEFT")
     outer.setStyle(
         TableStyle(
             [
@@ -572,9 +621,9 @@ def kpi_tiles(kpis: List[Dict], content_w: float, tiles_per_row: int = 4) -> Tab
                 ("RIGHTPADDING", (0, 0), (-1, -1), 0),
                 ("TOPPADDING", (0, 0), (-1, -1), 0),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                ("COLSPACING", (0, 0), (-1, -1), gutter),
+                ("ROWSPACING", (0, 0), (-1, -1), gutter),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("ROWSPACING", (0, 0), (-1, -1), 6),
-                ("COLSPACING", (0, 0), (-1, -1), 6),
             ]
         )
     )
@@ -582,7 +631,7 @@ def kpi_tiles(kpis: List[Dict], content_w: float, tiles_per_row: int = 4) -> Tab
 
 
 # -----------------------------
-# PDF: Image fit
+# PDF: Image fit (fill nicely but never overflow)
 # -----------------------------
 def fit_image_to_content(image_bytes: bytes, content_w: float, content_h: float) -> RLImage:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -602,8 +651,7 @@ def fit_image_to_content(image_bytes: bytes, content_w: float, content_h: float)
 # -----------------------------
 def generate_pdf(
     meta: ReportMeta,
-    kpi_list: List[Dict],
-    contract_consumption_text: str,
+    kpi_tiles: List[Dict],
     manual_summary_text: str,
     tables_in_order: List[Dict],
     embedded_images: List[EmbeddedImage],
@@ -637,21 +685,19 @@ def generate_pdf(
     story.append(Paragraph("Prepared for external sharing", styles["Muted"]))
     story.append(PageBreak())
 
-    # Executive Summary: KPI tiles + contract + manual narrative
+    # Executive Summary
     story.append(Paragraph("Executive Summary", styles["H1"]))
     story.append(Paragraph("High-level KPIs and reporting performance overview.", styles["Body"]))
-    story.append(Spacer(1, 8 * mm))
+    story.append(Spacer(1, 10 * mm))
 
-    story.append(kpi_tiles(kpi_list, content_w, tiles_per_row=4))
-    story.append(Spacer(1, 8 * mm))
-
-    # Contract Consumption card-like paragraph
-    story.append(Paragraph("Contract Consumption", styles["H2"]))
-    story.append(Paragraph(contract_consumption_text, styles["Body"]))
-    story.append(Spacer(1, 6 * mm))
+    tiles_tbl = kpi_tiles_grid(kpi_tiles, content_w, cols=4)
+    story.append(tiles_tbl)
+    story.append(Spacer(1, 12 * mm))
 
     if manual_summary_text.strip():
-        story.append(Paragraph("Narrative Summary", styles["H2"]))
+        story.append(Paragraph("Narrative Summary", styles["H1"]))
+        story.append(Paragraph("Notes added manually for external sharing.", styles["Body"]))
+        story.append(Spacer(1, 6 * mm))
         for para in manual_summary_text.strip().split("\n"):
             if para.strip():
                 story.append(Paragraph(para.strip(), styles["Body"]))
@@ -659,39 +705,46 @@ def generate_pdf(
 
     story.append(PageBreak())
 
-    # One table per page, auto-fit to page height
-    # Reserve some height for title/subtitle on each table page
-    table_avail_h = content_h - (28 * mm)  # for header text space
+    # Tables: one per page, dynamic size + centered
+    header_block_h = 26 * mm  # title + subtitle space
+    note_h = 6 * mm
+
     table_avail_w = content_w
+    table_avail_h = content_h - header_block_h - note_h
 
     for item in tables_in_order:
         title = item.get("title", "Table")
         subtitle = item.get("subtitle", "")
         df = item.get("df", pd.DataFrame())
-        max_rows = item.get("max_rows", 60)
+        max_rows = item.get("max_rows", 80)
 
         story.append(Paragraph(title, styles["H1"]))
         if subtitle:
             story.append(Paragraph(subtitle, styles["Body"]))
-        story.append(Spacer(1, 4 * mm))
+        story.append(Spacer(1, 6 * mm))
 
         if df is None or df.empty:
             story.append(Paragraph("No data available for this view based on current filters.", styles["Body"]))
-        else:
-            # auto-fit table to available area
-            t = auto_fit_table(df, avail_w=table_avail_w, avail_h=table_avail_h, max_rows=max_rows)
-            story.append(t)
+            story.append(PageBreak())
+            continue
 
-            if len(df) > max_rows:
-                story.append(Spacer(1, 2 * mm))
-                story.append(Paragraph(f"Note: showing first {max_rows} rows to fit the page.", styles["TinyNote"]))
+        tbl, truncated = auto_fit_table_dynamic(df, avail_w=table_avail_w, avail_h=table_avail_h, max_rows=max_rows)
+
+        # Center the table vertically so page doesn't look empty
+        w, h = tbl.wrap(table_avail_w, table_avail_h)
+        centered_parts = centered_flowable(tbl, table_avail_h, h)
+        story.extend(centered_parts)
+
+        if truncated:
+            story.append(Paragraph(f"Note: showing first {max_rows} rows to fit on one page.", styles["TinyNote"]))
 
         story.append(PageBreak())
 
-    # Embedded images: each on its own page with header + subtitle
+    # Embedded images: each on its own page with header + subtitle, centered
     if embedded_images:
-        img_avail_h = content_h - (34 * mm)  # allow header + subtitle
+        img_header_h = 30 * mm
         img_avail_w = content_w
+        img_avail_h = content_h - img_header_h
 
         for ei in embedded_images:
             story.append(Paragraph(ei.header or "Embedded Image", styles["H1"]))
@@ -699,7 +752,11 @@ def generate_pdf(
                 story.append(Paragraph(ei.subtitle, styles["Body"]))
             story.append(Spacer(1, 6 * mm))
 
-            story.append(fit_image_to_content(ei.bytes_, img_avail_w, img_avail_h))
+            img_flow = fit_image_to_content(ei.bytes_, img_avail_w, img_avail_h)
+            # Center image vertically in remaining space
+            w, h = img_flow.wrap(img_avail_w, img_avail_h)
+            story.extend(centered_flowable(img_flow, img_avail_h, h))
+
             story.append(PageBreak())
 
     def on_page(canvas, doc_):
@@ -715,7 +772,7 @@ def generate_pdf(
 # -----------------------------
 st.set_page_config(page_title="Monthly Business Review Report", layout="wide")
 st.title("Monthly Business Review Report Builder")
-st.caption("Upload your shipment file, filter, review tables, and export a formatted PDF (auto-fit tables & images).")
+st.caption("Upload your shipment file, filter, review tables, and export a formatted PDF (designed for external sharing).")
 
 with st.sidebar:
     st.header("1) Upload")
@@ -737,10 +794,10 @@ with st.sidebar:
 
     st.divider()
     st.header("4) Assets")
-    st.caption("Logo: defaults to repo logo if present (assets/p44_logo.png), else upload here.")
+    st.caption("Logo: upload here, or add a repo logo at assets/p44_logo.png.")
     logo_up = st.file_uploader("Upload logo (PNG)", type=["png"], key="logo")
 
-    st.caption("Embedded images (multiple). Each image becomes a separate PDF page.")
+    st.caption("Embedded images (multiple). Each becomes a separate PDF page.")
     embedded_files = st.file_uploader(
         "Upload images to embed (PNG/JPG) — select multiple",
         type=["png", "jpg", "jpeg"],
@@ -924,15 +981,12 @@ if "Lane" in fdf.columns and "Shipment ID" in fdf.columns and fdf["Lane"].astype
         )
     lane_o_table = pd.DataFrame(lane_o_group).sort_values("Shipments", ascending=False)
 
-# Contract consumption
+# Contract consumption (as tile)
 consumption_ratio = (billed_volume / contracted_volume) if contracted_volume else float("inf")
-consumption_text = (
-    f"Contracted: {contracted_volume:,.0f} | Billed: {billed_volume:,.0f} | "
-    f"Consumption: {consumption_ratio*100:,.1f}%"
-)
+consumption_pct = (consumption_ratio * 100) if contracted_volume else None
 
 # -----------------------------
-# Dashboard (tables + KPIs)
+# Dashboard (tables + KPIs) — unchanged (Streamlit side)
 # -----------------------------
 st.subheader("Summary")
 k1, k2, k3, k4 = st.columns(4)
@@ -945,17 +999,6 @@ c1, c2, c3 = st.columns(3)
 c1.metric("Marked Completed", f"{num_marked_completed:,}")
 c2.metric("Timed Out (per rule)", f"{num_timed_out:,}")
 c3.metric("Destination ETA accurate", f"{dest_est_accurate:,} / {dest_est_assessable:,}")
-
-st.markdown(
-    f"""
-<div style="padding:14px;border:1px solid #E5E7EB;border-radius:14px;background:{kpi_bg_hex(consumption_ratio)};
-color:#1F2933;">
-  <div style="font-size:16px;font-weight:700;margin-bottom:6px;">Contract Consumption</div>
-  <div style="font-size:13px;">{consumption_text}</div>
-</div>
-""",
-    unsafe_allow_html=True,
-)
 
 st.divider()
 st.subheader("Milestone reporting (selected)")
@@ -1000,7 +1043,7 @@ date_range_label = f"{start_date.strftime('%d %b %Y')} – {end_date.strftime('%
 report_title = f"Monthly Business Review Report - {customer_name} - {date_range_label}"
 meta = ReportMeta(customer_name=customer_name, date_range_label=date_range_label, report_title=report_title)
 
-# Logo bytes: upload takes precedence; else fallback to assets/p44_logo.png if present in repo
+# Logo bytes: upload takes precedence; else fallback to assets/p44_logo.png
 logo_bytes = None
 if logo_up:
     logo_bytes = logo_up.getvalue()
@@ -1011,8 +1054,21 @@ else:
     except Exception:
         logo_bytes = None
 
-# KPI tiles list (tone can be used for background)
-kpi_list = [
+# Contract tile tone based on consumption
+if contracted_volume and billed_volume:
+    if consumption_ratio <= 1.0:
+        contract_tone = "pos"
+    elif consumption_ratio <= 1.05:
+        contract_tone = "amber"
+    else:
+        contract_tone = "critical"
+else:
+    contract_tone = "neutral"
+
+contract_sub = f"Contracted: {contracted_volume:,.0f} | Billed: {billed_volume:,.0f}"
+contract_value = fmt_pct(consumption_pct) if consumption_pct is not None else "—"
+
+kpi_tiles = [
     {"label": "Number of Shipments", "value": fmt_int(num_shipments), "tone": "neutral"},
     {"label": "Number of Carriers", "value": fmt_int(num_carriers), "tone": "neutral"},
     {"label": "All selected milestones (#)", "value": fmt_int(num_all_selected), "tone": "neutral"},
@@ -1021,26 +1077,31 @@ kpi_list = [
     {"label": "Timed Out (per rule)", "value": fmt_int(num_timed_out), "tone": "amber" if num_timed_out else "pos"},
     {"label": "No Exceptions", "value": fmt_int(no_exc), "tone": "pos"},
     {"label": "With Exceptions", "value": fmt_int(with_exc), "tone": "amber" if with_exc else "pos"},
+    # Contract consumption as part of tiles grid:
+    {"label": "Contract Consumption", "value": contract_value, "subvalue": contract_sub, "tone": contract_tone},
 ]
+
+# Put contract tile at the end: it will naturally create a 3rd row (still aligned)
+# If you want it to always appear as the FIRST tile of row 3, this is perfect.
 
 tables_in_order = [
     {
         "title": "Milestone Reporting",
         "subtitle": "Reporting counts and percentages for selected milestones.",
         "df": milestone_table,
-        "max_rows": 60,
+        "max_rows": 80,
     },
     {
         "title": "Carrier-wise Summary",
         "subtitle": "Shipments and reporting performance by carrier.",
         "df": carrier_table,
-        "max_rows": 60,
+        "max_rows": 80,
     },
     {
         "title": "On-time Performance (OTP)",
         "subtitle": f"On-time uses latest planned END time + {latency_minutes} minutes latency.",
         "df": otp_table,
-        "max_rows": 60,
+        "max_rows": 80,
     },
 ]
 
@@ -1049,8 +1110,8 @@ if not lane_m_table.empty:
         {
             "title": "Lane Insights — Milestone Reporting",
             "subtitle": "Top lanes by shipment volume.",
-            "df": lane_m_table.head(200),
-            "max_rows": 60,
+            "df": lane_m_table.head(300),
+            "max_rows": 80,
         }
     )
 
@@ -1059,12 +1120,11 @@ if not lane_o_table.empty:
         {
             "title": "Lane Insights — On-time Performance",
             "subtitle": "Top lanes by shipment volume.",
-            "df": lane_o_table.head(200),
-            "max_rows": 60,
+            "df": lane_o_table.head(300),
+            "max_rows": 80,
         }
     )
 
-# Add exception breakdown table if you want it in PDF as well
 if not exc_counts.empty:
     exc_table = exc_counts.reset_index()
     exc_table.columns = ["Exception", "Count"]
@@ -1073,11 +1133,10 @@ if not exc_counts.empty:
             "title": "Exceptions Breakdown",
             "subtitle": "Exception-wise distribution (non-empty exceptions).",
             "df": exc_table,
-            "max_rows": 60,
+            "max_rows": 80,
         }
     )
 
-# Add destination estimated accuracy as a tiny table page (optional)
 dest_acc_df = pd.DataFrame(
     [
         {
@@ -1093,15 +1152,14 @@ tables_in_order.append(
         "title": "Destination ETA Accuracy",
         "subtitle": f"Latency threshold = {latency_minutes} minutes.",
         "df": dest_acc_df,
-        "max_rows": 10,
+        "max_rows": 20,
     }
 )
 
 if st.button("Generate PDF Report"):
     pdf_bytes = generate_pdf(
         meta=meta,
-        kpi_list=kpi_list,
-        contract_consumption_text=consumption_text,
+        kpi_tiles=kpi_tiles,
         manual_summary_text=manual_summary,
         tables_in_order=tables_in_order,
         embedded_images=embedded_images,
